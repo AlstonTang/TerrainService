@@ -1,0 +1,3103 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<Meta name="ExplicitAutoJoints">true</Meta>
+	<External>null</External>
+	<External>nil</External>
+	<Item class="Script" referent="RBX39053F38E1194C1680C3BB7BAA2EA68B">
+		<Properties>
+			<ProtectedString name="Source"><![CDATA[--!native
+--[[
+	TerrainService v4.0 (Performance & Config API Update)
+	- OPTIMIZATION: Reworked the TerrainWorker to pre-calculate a heightmap and normalmap, eliminating thousands of redundant noise samples per chunk. This dramatically speeds up generation.
+	- API: Introduced a centralized configuration system. Use TerrainAPI.GetTerrainConfig() and TerrainAPI.SetTerrainConfig(newConfig) for safe, replicated config management.
+	- REFACTOR: Decoupled TerrainMath and FeatureGenerators from a static config file. They now receive the config as a parameter, improving thread safety and modularity.
+	- The active configuration is passed to workers via a SharedTable for each job, ensuring they always use the latest settings.
+    - FIX: Accurate chunk unloading now uses the stored Y bounds (startY and chunkHeight) instead of assuming Y=0 to MAX_HEIGHT.
+]]
+
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local SharedTableRegistry = game:GetService("SharedTableRegistry")
+local Terrain = workspace.Terrain
+
+-- Child Objects (The new Relay system)
+local RelayActor = script:WaitForChild("Relay")
+local RegisterEvent = RelayActor:WaitForChild("Register")
+local SingleToSingleEvent = RelayActor:WaitForChild("SingleToSingle")
+
+-- Configuration & Modules
+local Root = script
+local DefaultTerrainConfig = require(Root.TerrainConfig)
+local TerrainMath = require(Root.TerrainMath)
+local FeatureRegistry = require(Root.FeatureRegistry)
+local Serializer = require(Root.Serializer)
+local TerrainWorkerScript = script.ChunkManagerActor.TerrainWorker
+
+-- State
+local currentTerrainConfig = nil
+
+local ready = false
+SingleToSingleEvent.Event:Once(function()
+	ready = true
+end)
+RunService.Heartbeat:Wait()
+RegisterEvent:Fire("ChunkDataReady")
+
+repeat
+	RunService.Heartbeat:Wait()
+until ready
+
+-- Disable default character spawning
+Players.CharacterAutoLoads = false
+
+--------------------------------------------------------------------------------
+-- Configuration Management
+--------------------------------------------------------------------------------
+local function UpdateConfig(newConfigTable)
+	currentTerrainConfig = newConfigTable
+	-- 1. Get the existing shared table object
+	-- We assume it has already been registered once.
+	local terrainSharedTable = SharedTableRegistry:GetSharedTable("TerrainConfig")
+
+	if not terrainSharedTable then
+		-- Handle case where it hasn't been created yet (initial setup)
+		local initialSerializedConfig = Serializer:Serialize(newConfigTable)
+		terrainSharedTable = SharedTable.new(initialSerializedConfig)
+		SharedTableRegistry:SetSharedTable("TerrainConfig", terrainSharedTable)
+		print("TerrainService: Initial configuration set.")
+		return
+	end
+
+	print("TerrainService: Updating existing shared table configuration...")
+
+	-- 3. Serialize and set the new contents (overwrite the internal data)
+	-- You can also merge/patch the data here instead of a full overwrite.
+	local serializedConfig = Serializer:Serialize(newConfigTable)
+	print(serializedConfig)
+
+	-- This sets the *internal data* of the existing shared table object
+	for key, value in serializedConfig do
+		terrainSharedTable[key] = value
+	end
+
+	-- Optionally clear out old keys if 'newConfigTable' is guaranteed to be complete
+	-- This part is optional and depends on your specific use case
+	for key in terrainSharedTable do
+		if serializedConfig[key] == nil then
+			terrainSharedTable[key] = nil -- Remove old key
+		end
+	end
+
+	print("TerrainService: Configuration updated in place and replicated.")
+end
+
+-- Initialize with default config
+UpdateConfig(DefaultTerrainConfig)
+
+--------------------------------------------------------------------------------
+-- FeatureManager Logic (Integrated - No Changes)
+--------------------------------------------------------------------------------
+local FeatureManager = {}
+FeatureManager.__index = FeatureManager
+
+function FeatureManager.new()
+	local self = setmetatable({
+		placedFeaturesByChunk = {},
+		chunkFeaturesParent = nil,
+	}, FeatureManager)
+	self:Initialize()
+	return self
+end
+
+function FeatureManager:Initialize()
+	print("FeatureManager: Initializing...")
+	self.chunkFeaturesParent = workspace:FindFirstChild("ChunkFeatures")
+	if not self.chunkFeaturesParent then
+		self.chunkFeaturesParent = Instance.new("Folder")
+		self.chunkFeaturesParent.Name = "ChunkFeatures"
+		self.chunkFeaturesParent.Parent = workspace
+	end
+	print("FeatureManager: Initialization complete.")
+end
+
+function FeatureManager:getChunkKey(x, z) return `{x},{z}` end
+
+function FeatureManager:StoreFeaturesForChunk(chunkX, chunkZ, featureContainers)
+	local chunkKey = self:getChunkKey(chunkX, chunkZ)
+	if self.placedFeaturesByChunk[chunkKey] then return end
+
+	local chunkFolder = Instance.new("Folder")
+	chunkFolder.Name = `Chunk_{chunkX}_{chunkZ}`
+
+	for _, blueprintList in ipairs(featureContainers) do
+		for _, blueprint in ipairs(blueprintList) do
+			local masterModel = blueprint.Model
+			if masterModel and masterModel:IsA("Model") then
+				local newInstance = masterModel:Clone()
+				local bounds = newInstance:GetBoundingBox()
+				if newInstance.PrimaryPart then
+					newInstance.PrimaryPart.PivotOffset = newInstance.PrimaryPart.CFrame:ToObjectSpace(bounds)
+				else
+					newInstance.WorldPivot = bounds
+				end
+
+				newInstance:PivotTo(blueprint.CFrame)
+
+				if blueprint.Identifier then
+					newInstance:SetAttribute("FeatureIdentifier", blueprint.Identifier)
+				end
+
+				newInstance.Parent = chunkFolder
+			else
+				warn(`[FeatureManager] Received a blueprint without a valid Model object.`)
+			end
+		end
+	end
+
+	if #chunkFolder:GetChildren() > 0 then
+		chunkFolder.Parent = self.chunkFeaturesParent
+		self.placedFeaturesByChunk[chunkKey] = chunkFolder
+	else
+		chunkFolder:Destroy()
+	end
+end
+
+function FeatureManager:ClearFeaturesForChunk(chunkX, chunkZ)
+	local chunkKey = self:getChunkKey(chunkX, chunkZ)
+	local chunkFolder = self.placedFeaturesByChunk[chunkKey]
+
+	if chunkFolder then
+		chunkFolder.Parent = nil
+
+		task.defer(function()
+			chunkFolder:Destroy()
+			self.placedFeaturesByChunk[chunkKey] = nil
+		end)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- ChunkManager Logic (Predictive Loading & Smart Write Queue)
+--------------------------------------------------------------------------------
+local ChunkManager = {}
+ChunkManager.__index = ChunkManager
+
+-- Constants
+local MIN_WORKERS = 8
+local MAX_WORKERS = 32
+local FORCE_LOAD_WORKERS = 2
+local PLAYER_GROUPING_DISTANCE_CHUNKS = 4
+local MAX_WORKERS_PER_GROUP = 4 -- TUNABLE: Max workers that can be assigned to one player/group.
+
+--- NEW: Constants for predictive loading
+local HIGH_VELOCITY_THRESHOLD = 75 -- Studs per second. Above this, predictive logic is used.
+local LOOK_AHEAD_TIME = 1.0 -- Seconds into the future to predict the player's position.
+
+local MAX_WRITES_PER_FRAME = 8
+local MAX_FEATURES_PER_FRAME = 4 -- NEW: Budget for placing features
+local MAX_UNLOADS_PER_FRAME = 16
+local WORLD_UNLOAD_INTERVAL = 60
+local lastFrameTime = 1/60
+
+-- Private utility
+local function CreateQueue()
+	local queue, head, tail = {}, 1, 0
+	return {
+		Push = function(self, item) tail += 1; queue[tail] = item end,
+		Pop = function(self)
+			if head > tail then return nil end
+			local item = queue[head]; queue[head] = nil; head += 1
+			if head > tail then head, tail = 1, 0 end
+			return item
+		end,
+		IsEmpty = function(self) return head > tail end,
+	}
+end
+
+function ChunkManager.new(relayActor, featureManagerInstance)
+	local self = setmetatable({
+		-- State
+		chunkStates = {},
+		players = {},
+		allWorkers = {},
+		playerGroups = {},
+
+		-- Queues
+		chunksToWrite = {},
+		featuresToPlace = {}, --- MODIFIED: This is now a list for prioritization, not a FIFO queue.
+		forceLoadQueue = CreateQueue(),
+		chunksToUnload = {},
+
+		-- Management
+		forceLoadRequests = {},
+		unloadCounter = 0,
+
+		-- Dependencies
+		relayActor = relayActor,
+		featureManager = featureManagerInstance,
+	}, ChunkManager)
+
+	SingleToSingleEvent.Event:Connect(function(messageName, ...)
+		if messageName == "ChunkDataReady" then
+			self:OnChunkDataReady(...)
+		end
+	end)
+
+	self:InitializeWorkers()
+	return self
+end
+
+function ChunkManager:InitializeWorkers()
+	print(`ChunkManager: Spawning initial {MIN_WORKERS} workers...`)
+	for i = 1, MIN_WORKERS do
+		self:_spawnWorker()
+	end
+	print("ChunkManager: Worker initialization complete.")
+end
+
+function ChunkManager:_spawnWorker()
+	local workerActor = Instance.new("Actor")
+	local workerScript = TerrainWorkerScript:Clone()
+	workerScript.Parent = workerActor
+	workerScript.Enabled = true
+	workerActor.Parent = script
+
+	local workerData = {
+		actor = workerActor,
+		state = "Idle",
+		assignedTo = nil,
+		lastJobTime = tick()
+	}
+	table.insert(self.allWorkers, workerData)
+	return workerData
+end
+
+-- Helper functions
+function ChunkManager:getChunkKey(x, z) return `{x},{z}` end
+function ChunkManager:getChunkCoordsFromPosition(position)
+	local chunkSize = currentTerrainConfig.TERRAIN_CHUNK_SIZE
+	return math.floor(position.X / chunkSize) * chunkSize, math.floor(position.Z / chunkSize) * chunkSize
+end
+
+-- MODIFIED: Helper to retrieve the string state from the potentially complex state data
+function ChunkManager:getChunkState(x, z) 
+	local stateData = (self.chunkStates[x] and self.chunkStates[x][z])
+	if type(stateData) == "table" then
+		return stateData.state
+	elseif type(stateData) == "string" then
+		return stateData
+	end
+	return "Unloaded" 
+end
+
+-- MODIFIED: Helper to set the state (can accept a string or the full metadata table)
+function ChunkManager:setChunkState(x, z, data)
+	if not self.chunkStates[x] then self.chunkStates[x] = {} end
+	self.chunkStates[x][z] = data
+end
+
+-- NEW: Helper to retrieve the full metadata table
+function ChunkManager:_getChunkMetadata(x, z)
+	return (self.chunkStates[x] and self.chunkStates[x][z])
+end
+
+--- Helper function to get all chunks currently in range of any player.
+function ChunkManager:_getAllRequiredChunks()
+	local allRequiredChunks = {}
+	local chunkSize = currentTerrainConfig.TERRAIN_CHUNK_SIZE
+
+	local VIEW_DISTANCE_CHUNKS = DefaultTerrainConfig.TARGET_CHUNK_RADIUS
+
+	for player, playerState in pairs(self.players) do
+		if playerState.CurrentChunkX then
+			for x = playerState.CurrentChunkX - (VIEW_DISTANCE_CHUNKS * chunkSize), playerState.CurrentChunkX + (VIEW_DISTANCE_CHUNKS * chunkSize), chunkSize do
+				for z = playerState.CurrentChunkZ - (VIEW_DISTANCE_CHUNKS * chunkSize), playerState.CurrentChunkZ + (VIEW_DISTANCE_CHUNKS * chunkSize), chunkSize do
+					allRequiredChunks[self:getChunkKey(x, z)] = true
+				end
+			end
+		end
+	end
+	return allRequiredChunks
+end
+
+
+-- Player Management
+function ChunkManager:AddPlayer(player)
+	self.players[player] = {
+		CurrentChunkX = nil,
+		CurrentChunkZ = nil,
+		LastPosition = nil,
+		Velocity = Vector3.zero,
+		LoadQueue = {},
+		LoadedChunks = {},
+	}
+end
+
+function ChunkManager:RemovePlayer(player) self.players[player] = nil end
+
+function ChunkManager:UpdatePlayer(player, deltaTime)
+	local playerState = self.players[player]
+	if not playerState then return end
+
+	local character = player.Character
+	if character and character.PrimaryPart then
+		local rootPosition = character.PrimaryPart.Position
+		local chunkX, chunkZ = self:getChunkCoordsFromPosition(rootPosition)
+
+		if playerState.LastPosition then
+			-- Store velocity per second for easier calculations
+			playerState.Velocity = (rootPosition - playerState.LastPosition) / deltaTime
+		end
+		playerState.LastPosition = rootPosition
+
+		if chunkX ~= playerState.CurrentChunkX or chunkZ ~= playerState.CurrentChunkZ then
+			playerState.CurrentChunkX, playerState.CurrentChunkZ = chunkX, chunkZ
+		end
+	else
+		playerState.CurrentChunkX = nil
+		playerState.CurrentChunkZ = nil
+		playerState.LastPosition = nil
+		playerState.Velocity = Vector3.zero
+	end
+end
+
+-- Core Processing Loop (called by main Heartbeat)
+function ChunkManager:Update()
+	-- ADDED: Get a fresh set of required chunks at the start of the frame.
+	local requiredChunks = self:_getAllRequiredChunks()
+
+	self:_groupPlayers()
+	self:_updateAndPrioritizePlayerQueues()
+	self:_assignAndDispatchJobs()
+	self:_processVoxelWriteQueue(requiredChunks) -- MODIFIED: Pass requiredChunks for optimization
+
+	if currentTerrainConfig.USE_FEATURES then
+		self:_processFeaturePlacementQueue(requiredChunks) -- MODIFIED: Pass requiredChunks for optimization
+	end
+
+	self.unloadCounter = (self.unloadCounter + 1) % WORLD_UNLOAD_INTERVAL
+	if self.unloadCounter == 0 then
+		self:_calculateUnloads(requiredChunks) -- MODIFIED: Pass requiredChunks to avoid recalculating
+	end
+
+	local unloadBudget = MAX_UNLOADS_PER_FRAME
+	while unloadBudget > 0 and #self.chunksToUnload > 0 do
+		local job = table.remove(self.chunksToUnload, 1)
+		local chunkKey = self:getChunkKey(job.x, job.z)
+		local state = self:getChunkState(job.x, job.z)
+
+		-- ADDED: The "just-in-time" check to prevent unnecessary unloads.
+		if requiredChunks[chunkKey] then
+			-- This chunk is needed again! Rescue it from unloading.
+			-- print(`[ChunkManager] Unload cancelled for chunk {chunkKey}. It is needed again.`)
+
+			-- Restore the state (Loaded or Empty) based on the stored metadata
+			local metadata = self:_getChunkMetadata(job.x, job.z)
+			if type(metadata) == "table" then
+				self:setChunkState(job.x, job.z, metadata) -- Restore full metadata
+			else
+				self:setChunkState(job.x, job.z, job.wasLoaded and "Loaded" or "Empty") -- Fallback if only string was stored
+			end
+
+			-- We don't decrement the budget because we didn't perform an unload.
+			-- We simply continue to the next item in the queue.
+		else
+			-- The chunk is still not needed, proceed with the unload.
+			self:_unloadChunkInternal(job.x, job.z, job.wasLoaded)
+			unloadBudget -= 1
+		end
+	end
+
+	self:_scaleWorkers()
+end
+
+--- Smart Voxel Write Logic
+function ChunkManager:_processVoxelWriteQueue(requiredChunks)
+	if #self.chunksToWrite == 0 then return end
+
+	-- Step 1: Invalidate stale requests (Dropoff)
+	for i = #self.chunksToWrite, 1, -1 do
+		local job = self.chunksToWrite[i]
+		if job.assignedTo ~= "System" and not requiredChunks[self:getChunkKey(job.chunkX, job.chunkZ)] then
+			table.remove(self.chunksToWrite, i)
+		end
+	end
+
+	-- Step 2: Prioritize remaining requests
+	table.sort(self.chunksToWrite, function(a, b)
+		local aIsForce = a.assignedTo == "System"
+		local bIsForce = b.assignedTo == "System"
+		if aIsForce ~= bIsForce then return aIsForce end
+
+		local aPlayerState = self.players[a.assignedTo]
+		local bPlayerState = self.players[b.assignedTo]
+
+		if not aPlayerState or not aPlayerState.LastPosition then return false end
+		if not bPlayerState or not bPlayerState.LastPosition then return true end
+
+		local aDist = (Vector2.new(a.chunkX, a.chunkZ) - Vector2.new(aPlayerState.LastPosition.X, aPlayerState.LastPosition.Z)).Magnitude
+		local bDist = (Vector2.new(b.chunkX, b.chunkZ) - Vector2.new(bPlayerState.LastPosition.X, bPlayerState.LastPosition.Z)).Magnitude
+
+		return aDist < bDist
+	end)
+
+	-- Step 3: Process the highest priority jobs within the budget
+	local writeBudget = MAX_WRITES_PER_FRAME
+	while writeBudget > 0 and #self.chunksToWrite > 0 do
+		local writeJob = table.remove(self.chunksToWrite, 1)
+		Terrain:WriteVoxels(writeJob.region, writeJob.resolution, writeJob.materials, writeJob.occupancy)
+		self:_handleForceLoadCompletion(writeJob.chunkX, writeJob.chunkZ)
+		writeBudget -= 1
+	end
+end
+
+--- NEW: Smart Feature Placement Logic
+function ChunkManager:_processFeaturePlacementQueue(requiredChunks)
+	if #self.featuresToPlace == 0 then return end
+
+	-- Step 1: Invalidate stale requests
+	for i = #self.featuresToPlace, 1, -1 do
+		local job = self.featuresToPlace[i]
+		if job.assignedTo ~= "System" and not requiredChunks[self:getChunkKey(job.chunkX, job.chunkZ)] then
+			table.remove(self.featuresToPlace, i)
+		end
+	end
+	-- Step 2: Prioritize remaining requests (same logic as voxel writing)
+	table.sort(self.featuresToPlace, function(a, b)
+		local aIsForce = a.assignedTo == "System"
+		local bIsForce = b.assignedTo == "System"
+		if aIsForce ~= bIsForce then return aIsForce end
+
+		local aPlayerState = self.players[a.assignedTo]
+		local bPlayerState = self.players[b.assignedTo]
+
+		if not aPlayerState or not aPlayerState.LastPosition then return false end
+		if not bPlayerState or not bPlayerState.LastPosition then return true end
+
+		local aDist = (Vector2.new(a.chunkX, a.chunkZ) - Vector2.new(aPlayerState.LastPosition.X, aPlayerState.LastPosition.Z)).Magnitude
+		local bDist = (Vector2.new(b.chunkX, b.chunkZ) - Vector2.new(bPlayerState.LastPosition.X, bPlayerState.LastPosition.Z)).Magnitude
+
+		return aDist < bDist
+	end)
+
+	-- Step 3: Process the highest priority jobs within the budget
+	local featureBudget = MAX_FEATURES_PER_FRAME
+	while featureBudget > 0 and #self.featuresToPlace > 0 do
+		local job = table.remove(self.featuresToPlace, 1)
+		self.featureManager:StoreFeaturesForChunk(job.chunkX, job.chunkZ, job.featureContainers)
+		featureBudget -= 1
+	end
+end
+
+
+function ChunkManager:_groupPlayers()
+	self.playerGroups = {}
+	local groupedPlayers = {}
+
+	for player, playerState in pairs(self.players) do
+		if not groupedPlayers[player] and playerState.CurrentChunkX then
+			local group = { leader = player, members = {player} }
+			groupedPlayers[player] = true
+
+			for otherPlayer, otherPlayerState in pairs(self.players) do
+				if player ~= otherPlayer and not groupedPlayers[otherPlayer] and otherPlayerState.CurrentChunkX then
+					local dist = (Vector2.new(playerState.CurrentChunkX, playerState.CurrentChunkZ) - Vector2.new(otherPlayerState.CurrentChunkX, otherPlayerState.CurrentChunkZ)).Magnitude
+					if dist <= PLAYER_GROUPING_DISTANCE_CHUNKS * currentTerrainConfig.TERRAIN_CHUNK_SIZE then
+						table.insert(group.members, otherPlayer)
+						groupedPlayers[otherPlayer] = true
+					end
+				end
+			end
+			table.insert(self.playerGroups, group)
+		end
+	end
+end
+
+--- MODIFIED: Replaced with predictive loading logic for high velocity.
+function ChunkManager:_updateAndPrioritizePlayerQueues()
+	local chunkSize = currentTerrainConfig.TERRAIN_CHUNK_SIZE
+	local VIEW_DISTANCE_CHUNKS = DefaultTerrainConfig.TARGET_CHUNK_RADIUS
+
+	for _, group in ipairs(self.playerGroups) do
+		local leader = group.leader
+		local leaderState = self.players[leader]
+		if not leaderState or not leaderState.LastPosition then continue end
+
+		leaderState.LoadQueue = {}
+
+		local requiredByGroup = {}
+		for _, member in ipairs(group.members) do
+			local memberState = self.players[member]
+			if memberState and memberState.CurrentChunkX then
+				for x = memberState.CurrentChunkX - (VIEW_DISTANCE_CHUNKS * chunkSize), memberState.CurrentChunkX + (VIEW_DISTANCE_CHUNKS * chunkSize), chunkSize do
+					for z = memberState.CurrentChunkZ - (VIEW_DISTANCE_CHUNKS * chunkSize), memberState.CurrentChunkZ + (VIEW_DISTANCE_CHUNKS * chunkSize), chunkSize do
+						requiredByGroup[self:getChunkKey(x, z)] = {x = x, z = z}
+					end
+				end
+			end
+		end
+
+		local leaderPos2D = Vector2.new(leaderState.LastPosition.X, leaderState.LastPosition.Z)
+		local leaderVel2D = Vector2.new(leaderState.Velocity.X, leaderState.Velocity.Z)
+		local leaderSpeed = leaderVel2D.Magnitude
+
+		local isHighVelocity = leaderSpeed > HIGH_VELOCITY_THRESHOLD
+		local priorityOrigin = leaderPos2D
+
+		if isHighVelocity then
+			-- Calculate a look-ahead position for high-speed players
+			priorityOrigin = leaderPos2D + leaderVel2D * LOOK_AHEAD_TIME
+		end
+
+		for _, coords in pairs(requiredByGroup) do
+			if self:getChunkState(coords.x, coords.z) == "Unloaded" then
+				local chunkPos = Vector2.new(coords.x + chunkSize/2, coords.z + chunkSize/2)
+				local priority = (priorityOrigin - chunkPos).Magnitude
+
+				if isHighVelocity then
+					-- Further refine priority by penalizing chunks behind the player
+					local toChunkDir = (chunkPos - leaderPos2D).Unit
+					local dot = leaderVel2D.Unit:Dot(toChunkDir)
+					if dot < -0.2 then -- Chunk is generally behind the player
+						priority += VIEW_DISTANCE_CHUNKS * chunkSize -- Add a large penalty
+					end
+				end
+
+				table.insert(leaderState.LoadQueue, {x = coords.x, z = coords.z, priority = priority})
+			end
+		end
+
+		table.sort(leaderState.LoadQueue, function(a, b) return a.priority < b.priority end)
+	end
+end
+
+
+function ChunkManager:_assignAndDispatchJobs()
+	local idleWorkers = {}
+	for _, workerData in ipairs(self.allWorkers) do
+		if workerData.state == "Idle" then
+			table.insert(idleWorkers, workerData)
+		end
+	end
+	if #idleWorkers == 0 then return end
+
+	local workerIndex = 1
+
+	-- Get the serialized config once per frame for all jobs dispatched this frame
+	local serializedConfig = SharedTableRegistry:GetSharedTable("TerrainConfig")
+
+	-- 1. Assign to force load queue (highest priority)
+	local forceLoadAssigned = 0
+	while workerIndex <= #idleWorkers and not self.forceLoadQueue:IsEmpty() and forceLoadAssigned < FORCE_LOAD_WORKERS do
+		local job = self.forceLoadQueue:Pop()
+		if self:getChunkState(job.x, job.z) == "QueuedForLoad" then
+			local worker = idleWorkers[workerIndex]
+			worker.state = "ForceLoading"
+			worker.assignedTo = "System"
+			worker.lastJobTime = tick()
+			self:setChunkState(job.x, job.z, "Generating")
+			worker.actor:SendMessage("GenerateChunk", job.x, job.z, self.relayActor, serializedConfig)
+			workerIndex += 1
+			forceLoadAssigned += 1
+		end
+	end
+
+	-- 2. Assign to player groups
+	for _, group in ipairs(self.playerGroups) do
+		if workerIndex > #idleWorkers then break end
+
+		local leader = group.leader
+		local leaderState = self.players[leader]
+
+		local workersAssignedToGroup = 0
+		for _, w in ipairs(self.allWorkers) do
+			if w.assignedTo == leader then
+				workersAssignedToGroup += 1
+			end
+		end
+
+		local workersToAssign = MAX_WORKERS_PER_GROUP - workersAssignedToGroup
+		for i = 1, workersToAssign do
+			if workerIndex > #idleWorkers or #leaderState.LoadQueue == 0 then
+				break
+			end
+
+			local job = table.remove(leaderState.LoadQueue, 1)
+			if self:getChunkState(job.x, job.z) == "Unloaded" then
+				self:setChunkState(job.x, job.z, "QueuedForLoad")
+			end
+
+			if self:getChunkState(job.x, job.z) == "QueuedForLoad" then
+				local worker = idleWorkers[workerIndex]
+				worker.state = "PlayerAssigned"
+				worker.assignedTo = leader
+				worker.lastJobTime = tick()
+				self:setChunkState(job.x, job.z, "Generating")
+				worker.actor:SendMessage("GenerateChunk", job.x, job.z, self.relayActor, serializedConfig)
+				workerIndex += 1
+			end
+		end
+	end
+end
+
+function ChunkManager:_scaleWorkers()
+	local activePlayerGroups = #self.playerGroups
+	local totalWorkers = #self.allWorkers
+
+	if activePlayerGroups > (totalWorkers - FORCE_LOAD_WORKERS) and totalWorkers < MAX_WORKERS then
+		print("ChunkManager: High load detected. Spawning new worker.")
+		self:_spawnWorker()
+	end
+
+	if totalWorkers > MIN_WORKERS then
+		for i = totalWorkers, 1, -1 do
+			local workerData = self.allWorkers[i]
+			if workerData.state == "Idle" and (tick() - workerData.lastJobTime) > 30 then
+				print("ChunkManager: Low load detected. Despawning idle worker.")
+				workerData.actor:Destroy()
+				table.remove(self.allWorkers, i)
+				break
+			end
+		end
+	end
+end
+
+function ChunkManager:_calculateUnloads(requiredChunks) -- MODIFIED: Accept parameter
+	local allRequiredChunks = requiredChunks or self:_getAllRequiredChunks()
+
+	local newUnloadRequests = {}
+	for x, zStates in pairs(self.chunkStates) do
+		for z, stateData in pairs(zStates) do
+			local state = self:getChunkState(x, z) -- Use helper to get string state
+			if state == "Loaded" or state == "Empty" then
+				if not allRequiredChunks[self:getChunkKey(x, z)] then
+					self:setChunkState(x, z, "QueuedForUnload") -- Set state string
+					table.insert(newUnloadRequests, {x = x, z = z, wasLoaded = (state == "Loaded")})
+				end
+			end
+		end
+	end
+
+	for _, req in ipairs(newUnloadRequests) do
+		table.insert(self.chunksToUnload, req)
+	end
+end
+
+function ChunkManager:_unloadChunkInternal(chunkX, chunkZ, wasLoaded)
+	local stateData = self:_getChunkMetadata(chunkX, chunkZ)
+	if not stateData or self:getChunkState(chunkX, chunkZ) ~= "QueuedForUnload" then return end
+
+	if self.featureManager and wasLoaded then
+		self.featureManager:ClearFeaturesForChunk(chunkX, chunkZ)
+	end
+
+	if wasLoaded then
+		-- FIX: Use the stored Y bounds for accurate clearing
+		local startY = stateData.startY
+		local chunkHeight = stateData.chunkHeight
+		local chunkSize = currentTerrainConfig.TERRAIN_CHUNK_SIZE
+		local resolution = currentTerrainConfig.VOXEL_RESOLUTION
+
+		local corner = Vector3.new(chunkX, startY, chunkZ)
+		local regionSize = Vector3.new(chunkSize, chunkHeight, chunkSize)
+
+		-- Clear only the region that was written
+		local region = Region3.new(corner, corner + regionSize):ExpandToGrid(resolution)
+		Terrain:FillRegion(region, resolution, Enum.Material.Air)
+	end
+
+	self:setChunkState(chunkX, chunkZ, "Unloaded")
+end
+
+function ChunkManager:ForceLoadChunks(chunksToLoad, onCompleteCallback)
+	local request = { ChunksRemaining = {}, Callback = onCompleteCallback }
+	for _, chunkCoords in ipairs(chunksToLoad) do
+		local key = self:getChunkKey(chunkCoords.x, chunkCoords.z)
+		local state = self:getChunkState(chunkCoords.x, chunkCoords.z)
+
+		if state ~= "Loaded" and state ~= "Empty" then
+			request.ChunksRemaining[key] = true
+			if state == "Unloaded" then
+				self:setChunkState(chunkCoords.x, chunkCoords.z, "QueuedForLoad")
+				self.forceLoadQueue:Push({x = chunkCoords.x, z = chunkCoords.z})
+			end
+		end
+	end
+
+	if next(request.ChunksRemaining) == nil then
+		if onCompleteCallback then task.spawn(onCompleteCallback) end
+	else
+		table.insert(self.forceLoadRequests, request)
+	end
+end
+
+function ChunkManager:_handleForceLoadCompletion(chunkX, chunkZ)
+	local chunkKey = self:getChunkKey(chunkX, chunkZ)
+	for i = #self.forceLoadRequests, 1, -1 do
+		local request = self.forceLoadRequests[i]
+		if request.ChunksRemaining[chunkKey] then
+			request.ChunksRemaining[chunkKey] = nil
+			if next(request.ChunksRemaining) == nil then
+				if request.Callback then task.spawn(request.Callback) end
+				table.remove(self.forceLoadRequests, i)
+			end
+		end
+	end
+end
+
+function ChunkManager:OnChunkDataReady(chunkX, chunkZ, isEmpty, workerActor, heightmap, materialmap, featureContainers, writeData)
+	local state = isEmpty and "Empty" or "Loaded"
+
+	-- MODIFIED: Store metadata for loaded chunks
+	if isEmpty then
+		self:setChunkState(chunkX, chunkZ, state)
+	else
+		local region: Region3 = writeData.region
+		local regionMin, regionMax = region.CFrame.Position - region.Size / 2, region.CFrame.Position + region.Size / 2
+		self:setChunkState(chunkX, chunkZ, {
+			state = state,
+			startY = regionMin.Y,
+			chunkHeight = regionMax.Y - regionMin.Y,
+		})
+	end
+
+	local workerData
+	for _, wd in ipairs(self.allWorkers) do
+		if wd.actor == workerActor then
+			workerData = wd
+			break
+		end
+	end
+
+	if workerData then
+		workerData.state = "Idle"
+	else
+		warn("ChunkManager: Received data from an untracked worker actor. It may have been despawned.")
+		workerActor:Destroy()
+		return
+	end
+
+	if isEmpty then
+		self:_handleForceLoadCompletion(chunkX, chunkZ)
+	else
+		if writeData then
+			writeData.chunkX = chunkX
+			writeData.chunkZ = chunkZ
+			writeData.assignedTo = workerData.assignedTo 
+			table.insert(self.chunksToWrite, writeData)
+		end
+		-- MODIFIED: Add to the prioritized feature list instead of a simple queue
+		if currentTerrainConfig.USE_FEATURES and self.featureManager and featureContainers and #featureContainers > 0 then
+			table.insert(self.featuresToPlace, {
+				chunkX = chunkX,
+				chunkZ = chunkZ,
+				featureContainers = featureContainers,
+				assignedTo = workerData.assignedTo
+			})
+		end
+	end
+
+	if workerData then
+		workerData.assignedTo = nil
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Main Service Logic (Initialization, Spawning, and Connections)
+--------------------------------------------------------------------------------
+
+local featureManager = FeatureManager.new()
+local chunkManager = ChunkManager.new(RelayActor, featureManager)
+
+local function getChunkCoordsFromPosition(position)
+	return chunkManager:getChunkCoordsFromPosition(position)
+end
+
+local function spawnPlayerCharacter(player: Player, spawnPos: Vector3)
+	local height = TerrainMath.getSurfaceHeightAt(spawnPos.X, spawnPos.Z, currentTerrainConfig)
+	local safeSpawnPos = Vector3.new(spawnPos.X, height + 6, spawnPos.Z)
+
+	print(`Spawning {player.Name} at surface height: {math.round(height)}`)
+	task.synchronize()
+	player:LoadCharacter()
+	local character = player.Character or player.CharacterAdded:Wait()
+	character:PivotTo(CFrame.new(safeSpawnPos))
+	task.desynchronize()
+end
+
+local function requestPlayerSpawn(player)
+	local spawnPoint = currentTerrainConfig.SPAWN_POINT
+	local spawnChunkX, spawnChunkZ = getChunkCoordsFromPosition(spawnPoint)
+	local immediateChunk = { {x = spawnChunkX, z = spawnChunkZ} }
+
+	chunkManager:ForceLoadChunks(immediateChunk, function()
+		spawnPlayerCharacter(player, spawnPoint)
+	end)
+end
+
+local function onPlayerAdded(player)
+	print(`Player {player.Name} has joined. Initiating controlled spawn.`)
+	chunkManager:AddPlayer(player)
+
+	player.CharacterAdded:Connect(function(character)
+		local humanoid = character:WaitForChild("Humanoid")
+		humanoid.Died:Connect(function()
+			task.wait(Players.RespawnTime)
+			requestPlayerSpawn(player)
+		end)
+	end)
+
+	requestPlayerSpawn(player)
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(function(player)
+	chunkManager:RemovePlayer(player)
+end)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	onPlayerAdded(player)
+end
+
+RunService.Heartbeat:Connect(function(deltaTime)
+	lastFrameTime = deltaTime -- Store for velocity calculations
+	for _, player in ipairs(Players:GetPlayers()) do
+		chunkManager:UpdatePlayer(player, deltaTime)
+	end
+
+	chunkManager:Update()
+end)
+
+print("TerrainService: Binding external API functions...")
+
+local ApiFolder = script:WaitForChild("Api")
+
+ApiFolder.GetChunkState.OnInvoke = function(position: Vector3)
+	local chunkX, chunkZ = getChunkCoordsFromPosition(position)
+	return chunkManager:getChunkState(chunkX, chunkZ)
+end
+
+ApiFolder.ForceLoadChunksAtPosition.OnInvoke = function(position: Vector3, radiusInChunks: number, onCompleteCallback: () -> ())
+	local chunkSize = currentTerrainConfig.TERRAIN_CHUNK_SIZE
+	local centerX, centerZ = getChunkCoordsFromPosition(position)
+
+	local chunksToLoad = {}
+	for x = centerX - (radiusInChunks * chunkSize), centerX + (radiusInChunks * chunkSize), chunkSize do
+		for z = centerZ - (radiusInChunks * chunkSize), centerZ + (radiusInChunks * chunkSize), chunkSize do
+			table.insert(chunksToLoad, {x = x, z = z})
+		end
+	end
+
+	chunkManager:ForceLoadChunks(chunksToLoad, onCompleteCallback)
+end
+
+ApiFolder.GetPlayerWorkerInfo.OnInvoke = function(requestingPlayer: Player, targetPlayer: Player)
+	if not targetPlayer then return { Error = "Target player not provided." } end
+
+	local playerState = chunkManager.players[targetPlayer]
+	if not playerState then return { Error = "Target player not tracked by ChunkManager." } end
+
+	local playerGroup = nil
+	for _, group in ipairs(chunkManager.playerGroups) do
+		for _, member in ipairs(group.members) do
+			if member == targetPlayer then
+				playerGroup = group
+				break
+			end
+		end
+		if playerGroup then break end
+	end
+
+	if not playerGroup then
+		return { IsInGroup = false, AssignedWorkers = 0 }
+	end
+
+	local workerCount = 0
+	for _, workerData in ipairs(chunkManager.allWorkers) do
+		if workerData.assignedTo == playerGroup.leader then
+			workerCount += 1
+		end
+	end
+
+	return {
+		IsInGroup = true,
+		GroupLeaderName = playerGroup.leader.Name,
+		AssignedWorkers = workerCount,
+	}
+end
+
+-- NEW CONFIG API
+ApiFolder.GetTerrainConfig.OnInvoke = function()
+	return currentTerrainConfig
+end
+
+ApiFolder.SetTerrainConfig.Event:Connect(function(newConfig)
+	if type(newConfig) == "table" then
+		UpdateConfig(newConfig)
+	else
+		warn("[TerrainService] SetTerrainConfig received an invalid argument. Expected a table.")
+	end
+end)
+
+
+print("TerrainService (Performance & Config API) is now running and API is ready.")]]></ProtectedString>
+			<bool name="Disabled">false</bool>
+			<Content name="LinkedSource"><null></null></Content>
+			<token name="RunContext">0</token>
+			<string name="ScriptGuid">{2596F4D4-47D3-42DE-80BB-E8A9EA68CEF3}</string>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+			<bool name="DefinesCapabilities">false</bool>
+			<string name="Name">TerrainService</string>
+			<int64 name="SourceAssetId">-1</int64>
+			<BinaryString name="Tags"></BinaryString>
+		</Properties>
+		<Item class="ModuleScript" referent="RBX374293C4F14541EA997C7366A91A848D">
+			<Properties>
+				<Content name="LinkedSource"><null></null></Content>
+				<ProtectedString name="Source"><![CDATA[--!native
+-- SplinearTerrain-Caveless Configuration v2.2 (Pure Data Module)
+-- This module now only defines and returns the default configuration table.
+-- All serialization and state management is handled by the main TerrainService script.
+
+local Root = script.Parent
+local Spline = require(Root.Spline)
+local Biome = require(script.Biome)
+
+--// Define Biomes //--
+
+-- A biome representing deep, winding canyons or river valleys.
+-- Height Spline(0) is the deepest point.
+local RiverCanyonBiome = Biome.new(
+	-- Height Spline: Mirrored, lowest point at center (0). Deeper and steeper walls.
+	Spline.new(
+		{
+			[-1] = 300,    -- High canyon rim (Mirrored edge)
+			[-0.5] = 280,
+			[-0.2] = 150,
+			[-0.1] = 105,
+			[0] = 90,      -- Deepest riverbed (Lowered base)
+			[0.1] = 105,
+			[0.2] = 150,
+			[0.5] = 280,
+			[1] = 300,     -- High canyon rim (Mirrored edge)
+		},
+		"cubicLerp"
+	),
+	Spline.new(
+		{
+			[-0.75] = -8,
+			[0] = 0,
+			[0.75] = 8,
+		},
+		"cubicLerp"
+	),
+	-- Material Spline: Focus on exposed bedrock (Sandstone) along the steep walls.
+	Spline.new(
+		{
+			[-1] = Enum.Material.Limestone,        -- Outer edge material (Mirrored)
+			[-0.4] = Enum.Material.Sandstone,
+			[-0.15] = Enum.Material.Sand,
+			[-0.08] = Enum.Material.Snow,   -- River starts
+			[-0.07] = Enum.Material.Glacier,      -- Center transition
+			[0] = Enum.Material.Glacier,       -- Central river material
+			[0.07] = Enum.Material.Glacier,       -- Center transition
+			[0.08] = Enum.Material.Snow,    -- River ends
+			[0.15] = Enum.Material.Sand,
+			[0.4] = Enum.Material.Sandstone,
+			[1] = Enum.Material.Limestone,         -- Outer edge material (Mirrored)
+		},
+		"discreteInterpolation"
+	),
+	-- Water Spline: Raised slightly higher above the new 90 base.
+	Spline.new(
+		{
+			[-0.07] = 96,
+			[0.07] = 96
+		},
+		"cubicLerp"
+	)
+)
+
+-- A biome representing high, rolling plateaus flanking the main canyons.
+local PlateauBiome = Biome.new(
+	-- Height Spline: Flat, high plateau top with a sharp, deep cut for the river.
+	Spline.new(
+		{
+			[-1] = 220,    -- Flat plateau top
+			[-0.4] = 220,
+			[-0.2] = 150,  -- Sharp drop zone
+			[-0.1] = 100,
+			[0] = 92,      -- Deepest riverbed
+			[0.1] = 100,
+			[0.2] = 150,
+			[0.4] = 220,
+			[1] = 220,     -- Flat plateau top
+		},
+		"cubicLerp"
+	),
+	Spline.new(
+		{
+			[-0.75] = -8,
+			[0] = 0,
+			[0.75] = 8,
+		},
+		"cubicLerp"
+	),
+	-- Material Spline: Exposed Rock on the steep plateau sides (around 0.2).
+	Spline.new(
+		{
+			[-1] = Enum.Material.Slate,        -- Outer edge material (Mirrored)
+			[-0.4] = Enum.Material.Grass,
+			[-0.2] = Enum.Material.Rock,    -- Exposed rock face
+			[-0.08] = Enum.Material.Snow,
+			[-0.07] = Enum.Material.Glacier,
+			[0] = Enum.Material.Glacier,
+			[0.07] = Enum.Material.Glacier,
+			[0.08] = Enum.Material.Snow,
+			[0.2] = Enum.Material.Rock,
+			[0.4] = Enum.Material.Grass,
+			[1] = Enum.Material.Slate,         -- Outer edge material (Mirrored)
+		},
+		"discreteInterpolation"
+	),
+	-- Water Spline: Raised above the new 92 base.
+	Spline.new(
+		{
+			[-0.07] = 96,
+			[0.07] = 96
+		},
+		"cubicLerp"
+	)
+)
+
+-- A biome representing gentle, low-relief rolling hills.
+local RollingHillsBiome = Biome.new(
+	-- Height Spline: Smoother, wider trench for the river, moderate maximum height.
+	Spline.new(
+		{
+			[-1] = 160,    -- High rolling edge (Mirrored)
+			[-0.6] = 140,
+			[-0.3] = 120,
+			[-0.1] = 100,
+			[0] = 93,      -- Lowest point for the riverbed
+			[0.1] = 100,
+			[0.3] = 120,
+			[0.6] = 140,
+			[1] = 160,     -- High rolling edge (Mirrored)
+		},
+		"cubicLerp"
+	),
+	-- Second Spline (kept simple, like examples)
+	Spline.new(
+		{
+			[-0.75] = -8,
+			[0] = 0,
+			[0.75] = 8,
+		},
+		"cubicLerp"
+	),
+	-- Material Spline: Broader use of Ground/Grass, typical of temperate hills.
+	Spline.new(
+		{
+			[-1] = Enum.Material.Grass,        -- Outer edge material (Mirrored)
+			[-0.5] = Enum.Material.Ground,
+			[-0.15] = Enum.Material.Ground,
+			[-0.08] = Enum.Material.Snow,
+			[-0.07] = Enum.Material.Glacier,
+			[0] = Enum.Material.Glacier,
+			[0.07] = Enum.Material.Glacier,
+			[0.08] = Enum.Material.Snow,
+			[0.15] = Enum.Material.Ground,
+			[0.5] = Enum.Material.Ground,
+			[1] = Enum.Material.Grass,         -- Outer edge material (Mirrored)
+		},
+		"discreteInterpolation"
+	),
+	-- Water Spline: Level 95 above the 93 base.
+	Spline.new(
+		{
+			[-0.07] = 95,
+			[0.07] = 95
+		},
+		"cubicLerp"
+	)
+)
+
+-- A biome representing nearly flat, cold plains with a subtle central dip.
+local TundraPlainsBiome = Biome.new(
+	-- Height Spline: Extremely flat profile, minimal relief overall, shallow river cut.
+	Spline.new(
+		{
+			[-1] = 130,    -- Flat outer edge (Mirrored)
+			[-0.5] = 125,
+			[-0.2] = 110,
+			[-0.1] = 100,
+			[0] = 95,      -- Shallowest riverbed
+			[0.1] = 100,
+			[0.2] = 110,
+			[0.5] = 125,
+			[1] = 130,     -- Flat outer edge (Mirrored)
+		},
+		"cubicLerp"
+	),
+	-- Second Spline (kept simple, like examples)
+	Spline.new(
+		{
+			[-0.75] = -8,
+			[0] = 0,
+			[0.75] = 8,
+		},
+		"cubicLerp"
+	),
+	-- Material Spline: Cold environment materials (Pavement/Snow/Ice) extending widely.
+	Spline.new(
+		{
+			[-1] = Enum.Material.Pavement,        -- Outer edge (suggesting frozen ground)
+			[-0.35] = Enum.Material.Snow,    -- Snow starts wide out
+			[-0.1] = Enum.Material.Ice,       -- Ice layer near the trench
+			[-0.08] = Enum.Material.Snow,
+			[-0.07] = Enum.Material.Glacier,
+			[0] = Enum.Material.Glacier,       -- Central river material
+			[0.07] = Enum.Material.Glacier,
+			[0.08] = Enum.Material.Snow,
+			[0.1] = Enum.Material.Ice,
+			[0.35] = Enum.Material.Snow,
+			[1] = Enum.Material.Pavement,         -- Outer edge (Mirrored)
+		},
+		"discreteInterpolation"
+	),
+	-- Water Spline: Level 98 above the 95 base, ensuring surrounding ice/glacier is submerged.
+	Spline.new(
+		{
+			[-0.07] = 98,
+			[0.07] = 98
+		},
+		"cubicLerp"
+	)
+)
+
+--// Main Configuration Table //--
+local TerrainConfig = {
+	--// Core Noise Settings //--
+	SEED = math.random(-2^30, 2^30),
+	FREQUENCY = 0.000875,
+	BIOME_FREQUENCY = 0.00025, -- Lower frequency to allow larger biomes
+
+	--// Biome Map Spline //--
+	-- This spline maps a biome noise value (-1 to 1) to a specific Biome object.
+	-- Structure: [-1] = Canyon, [0] = Plateau, [1] = Canyon (Mirrored structure)
+	BIOMES = Spline.new(
+		{
+			[-0.35] = RollingHillsBiome,
+			[-0.3] = RiverCanyonBiome,
+			[-0.05] = RiverCanyonBiome,
+			[0.05] = PlateauBiome,
+			[0.3] = PlateauBiome,
+			[0.35] = TundraPlainsBiome,
+		},
+		"blendBiome"
+	),
+
+	--// Technical & Spawning Settings //--
+	TERRAIN_CHUNK_SIZE = 64,
+	TARGET_CHUNK_RADIUS = 16,
+	VOXEL_RESOLUTION = 4,
+	SPAWN_POINT = Vector3.new(0, 200, 0),
+	USE_FEATURES = false,
+	ENABLE_WATER = false,
+}
+
+-- Pre-calculate max height for the worker.
+local maxOverallHeight = 0
+-- Iterate through the base biomes defined in the BIOMES spline's keypoints
+for _, biome in pairs(TerrainConfig.BIOMES.Keypoints) do
+	if biome.HeightSpline and biome.DeviationSpline then
+		local _, maxBiomeHeight = biome.HeightSpline:GetBounds()
+		local _, maxBiomeDev = biome.DeviationSpline:GetBounds()
+		-- The max height for a biome is its highest point plus the largest possible deviation.
+		if maxBiomeHeight and maxBiomeDev then
+			maxOverallHeight = math.max(maxOverallHeight, maxBiomeHeight + maxBiomeDev)
+		end
+	end
+end
+
+TerrainConfig.MAX_HEIGHT = math.ceil(maxOverallHeight)
+
+return TerrainConfig]]></ProtectedString>
+				<string name="ScriptGuid">{5452AEB1-4AD8-480C-B807-84D30172BD7B}</string>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">TerrainConfig</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+			<Item class="ModuleScript" referent="RBX00E50155C71A4CC6A5CB1643EC87D711">
+				<Properties>
+					<Content name="LinkedSource"><null></null></Content>
+					<ProtectedString name="Source"><![CDATA[--!native
+
+local Root = script.Parent.Parent
+local Spline = require(Root.Spline)
+
+local Biome = {}
+Biome.__className = "Biome"
+
+function Biome.new(Height: Spline.SplineObject<number>, Deviation: Spline.SplineObject<number>, Material: Spline.SplineObject<Enum.Material>, Water: Spline.SplineObject<number>)
+	local self = {}
+	
+	self.HeightSpline = Height
+	self.DeviationSpline = Deviation
+	self.MaterialSpline = Material
+	self.WaterSpline = Water
+
+	return self
+end
+
+-- New static function to blend two biomes
+function Biome.Blend(biomeA, biomeB, t: number, interpolationFn: (number, number, number) -> (number)?, discreteInterpolatonFn: (any, any, number) -> (any)?)
+	if biomeA == biomeB then return biomeA end
+	if t <= 0 then return biomeA end
+	if t >= 1 then return biomeB end
+
+	-- Blend each component spline individually
+	local blendedHeight = Spline.Blend(biomeA.HeightSpline, biomeB.HeightSpline, t, interpolationFn)
+	local blendedDeviation = Spline.Blend(biomeA.DeviationSpline, biomeB.DeviationSpline, t, interpolationFn)
+	local blendedMaterial = Spline.Blend(biomeA.MaterialSpline, biomeB.MaterialSpline, t, discreteInterpolatonFn)
+	local blendedWater = Spline.Blend(biomeA.WaterSpline, biomeB.WaterSpline, t, interpolationFn)
+
+	-- Construct a new biome from the blended splines
+	return Biome.new(blendedHeight, blendedDeviation, blendedMaterial, blendedWater)
+end
+
+local Serializer = require(Root.Serializer)
+Serializer:HookToSerializer(Biome)
+
+return Biome]]></ProtectedString>
+					<string name="ScriptGuid">{AC95EC01-4FCB-4133-95CF-0335E976CA78}</string>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">Biome</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+		</Item>
+		<Item class="ModuleScript" referent="RBX94F628B076AC41E3A6BDCED9DC470132">
+			<Properties>
+				<Content name="LinkedSource"><null></null></Content>
+				<ProtectedString name="Source"><![CDATA[--!native
+
+-- SplinearTerrain-Caveless Math v2.1 (Decoupled Config)
+-- This module is now a pure utility library. It accepts the configuration
+-- table as a parameter to its functions, making it thread-safe and modular.
+
+local TerrainMath = {}
+
+TerrainMath.VOXEL_TYPE = {
+	AIR = 0,
+	SURFACE = 1,
+	GROUND = 2,
+}
+
+---
+-- The core sampling function. Determines height and material at any world coordinate.
+-- This function is the new heart of the terrain generation.
+---
+function TerrainMath.getSurfacePropertiesAt(worldX: number, worldZ: number, config: table)
+	-- 1. Determine the biome first using a separate, larger-scale noise.
+	local biomeScaledX = worldX * config.BIOME_FREQUENCY
+	local biomeScaledZ = worldZ * config.BIOME_FREQUENCY
+	local biomeNoise = math.clamp(math.noise(biomeScaledX, biomeScaledZ, config.SEED), -1, 1)
+
+	-- 2. Get the current biome (which may be a blend of two) from the BIOMES spline.
+	local currentBiome = config.BIOMES(biomeNoise)
+
+	-- 3. Get the local height/detail noise values for the terrain shape.
+	local scaledX, scaledZ = worldX * config.FREQUENCY, worldZ * config.FREQUENCY
+	local noiseValue = math.clamp(math.noise(
+		scaledX,
+		scaledZ,
+		config.SEED
+		),-1, 1)
+	local biasValue = math.clamp(math.noise(
+		scaledZ,
+		scaledX,
+		config.SEED
+		),-1, 1)
+
+	-- 4. Use the splines from the calculated biome to map the noise to height and material.
+	local height = math.clamp(currentBiome.HeightSpline(noiseValue) + currentBiome.DeviationSpline(biasValue), 0, config.MAX_HEIGHT)
+	local material = currentBiome.MaterialSpline(noiseValue)
+	
+	local waterHeight = config.ENABLE_WATER and math.clamp(currentBiome.WaterSpline(noiseValue) + currentBiome.DeviationSpline(biasValue), 0, config.MAX_HEIGHT) or -math.huge
+
+	-- 5. Return the properties in a format compatible with the rest of the system.
+	return height, material, waterHeight
+end
+
+---
+-- Public API function to get only the height. Maintains compatibility.
+---
+function TerrainMath.getSurfaceHeightAt(worldX: number, worldZ: number, config: table)
+	local height, _ = TerrainMath.getSurfacePropertiesAt(worldX, worldZ, config)
+	return height
+end
+
+---
+-- Calculates the surface normal for orienting features (like trees).
+-- This function remains crucial for realistic feature placement.
+---
+function TerrainMath.getSurfaceNormalAt(worldX: number, worldZ: number, config: table)
+	local epsilon = 0.001 -- A small offset for sampling
+
+	local h_px = TerrainMath.getSurfaceHeightAt(worldX + epsilon, worldZ, config)
+	local h_nx = TerrainMath.getSurfaceHeightAt(worldX - epsilon, worldZ, config)
+	local h_pz = TerrainMath.getSurfaceHeightAt(worldX, worldZ + epsilon, config)
+	local h_nz = TerrainMath.getSurfaceHeightAt(worldX, worldZ - epsilon, config)
+
+	local normal = Vector3.new(h_nx - h_px, 2 * epsilon, h_nz - h_pz)
+	return normal.Unit
+end
+
+function TerrainMath.getSlopeAt(worldX: number, worldZ: number, config: table)
+	return math.tan(math.acos(TerrainMath.getSurfaceNormalAt(worldZ, worldZ, config).Y))
+end
+
+function TerrainMath.getSurfaceCaveThreshold(height: number, slope: number)
+	return height - (slope + 4)^2
+end
+
+--[[
+Function used to get the surface height with account of caves. Deprecated right now because no caves.
+]]
+function TerrainMath.getFloorHeightAt(worldX: number, worldZ: number, config: table)
+	return TerrainMath.getSurfaceHeightAt(worldX, worldZ, config)
+end
+
+function TerrainMath.getVoxelTypeAt(worldX: number, worldY: number, worldZ: number, config: table)
+	local surfaceHeight = TerrainMath.getSurfaceHeightAt(worldX, worldZ, config)
+
+	if worldY > surfaceHeight then
+		return TerrainMath.VOXEL_TYPE.AIR
+	elseif worldY > TerrainMath.getSurfaceCaveThreshold(surfaceHeight, TerrainMath.getSlopeAt(worldX, worldZ, config)) then
+		return TerrainMath.VOXEL_TYPE.SURFACE
+	end
+	return TerrainMath.VOXEL_TYPE.GROUND
+end
+
+return TerrainMath]]></ProtectedString>
+				<string name="ScriptGuid">{ADE736AD-ADFC-4214-9094-EFF7B5E806E3}</string>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">TerrainMath</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX356C5F3D7DBD481ABCD918924D0584E4">
+			<Properties>
+				<Content name="LinkedSource"><null></null></Content>
+				<ProtectedString name="Source"><![CDATA[--!native
+-- [UNCHANGED] Tracks the state of features (like trees, rocks, or doors) that have been modified.
+-- This implementation is already flexible and does not need changes for the new system.
+
+local FeatureRegistry = {}
+FeatureRegistry.__index = FeatureRegistry
+
+local TerrainConfig = require(script.Parent.TerrainConfig) -- OK since this is sngle-threaded context at most.
+local CHUNK_SIZE = TerrainConfig.TERRAIN_CHUNK_SIZE
+local stateCache = {}
+
+local function getChunkKey(x, z) return `{x},{z}` end
+
+local function getChunkKeyFromIdentifier(identifier)
+	if not identifier then return nil end
+
+	local parts = string.split(identifier, ":")
+	if #parts < 3 then return nil end
+
+	local coordsStr = parts
+	local coords = table.concat(coordsStr, ",")
+
+	local worldX = tonumber(coords)
+	local worldZ = tonumber(coords[#coords])
+
+	if not worldX or not worldZ then return nil end
+
+	local chunkX = math.floor(worldX / CHUNK_SIZE) * CHUNK_SIZE
+	local chunkZ = math.floor(worldZ / CHUNK_SIZE) * CHUNK_SIZE
+
+	return getChunkKey(chunkX, chunkZ)
+end
+
+function FeatureRegistry:SetFeatureState(identifier, key, value)
+	local chunkKey = getChunkKeyFromIdentifier(identifier)
+	if not chunkKey then
+		warn(`[FeatureRegistry] Could not set state for invalid identifier: {identifier}`)
+		return
+	end
+
+	if not stateCache[chunkKey] then
+		stateCache[chunkKey] = {}
+	end
+
+	if not stateCache[chunkKey][identifier] then
+		stateCache[chunkKey][identifier] = {}
+	end
+
+	stateCache[chunkKey][identifier][key] = value
+end
+
+function FeatureRegistry:GetFeatureState(identifier, key)
+	local chunkKey = getChunkKeyFromIdentifier(identifier)
+	if not chunkKey then return nil end
+
+	local chunkData = stateCache[chunkKey]
+	if not chunkData then return nil end
+
+	local featureData = chunkData[identifier]
+	if not featureData then return nil end
+
+	if key then
+		return featureData[key]
+	else
+		return featureData
+	end
+end
+
+function FeatureRegistry:RegisterDestruction(identifier)
+	self:SetFeatureState(identifier, "destroyed", true)
+end
+
+function FeatureRegistry:IsDestroyed(identifier)
+	return self:GetFeatureState(identifier, "destroyed") == true
+end
+
+return FeatureRegistry]]></ProtectedString>
+				<string name="ScriptGuid">{1F7DD1F2-0913-45B9-A789-52A8F2E08C68}</string>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">FeatureRegistry</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBXFE3920645D314295B7E6A34E0B015CCA">
+			<Properties>
+				<Content name="LinkedSource"><null></null></Content>
+				<ProtectedString name="Source"><![CDATA[--!native
+-- FeaturePlacer v2.0
+-- A utility module for correctly placing models on the terrain surface.
+-- It handles finding the ground height, calculating orientation, and constructing a final CFrame.
+-- Supports two placement modes:
+-- 1. Simple: Places the model's pivot on the ground.
+-- 2. Advanced (Lowest Point): Places the model's lowest bounding box corner on the ground.
+
+local FeaturePlacer = {}
+
+---
+-- Calculates a CFrame that places an object on the ground, oriented to the surface normal.
+-- @param position The Vector3 position on the ground.
+-- @param normal The Vector3 normal of the surface at that position.
+-- @return The calculated CFrame.
+local function getCFrameOnSurface(position, normal)
+	local upVector = normal
+	local arbitraryReferenceVector = Vector3.new(0, 1, 0)
+
+	if math.abs(upVector:Dot(arbitraryReferenceVector)) > 0.9999 then
+		arbitraryReferenceVector = Vector3.new(1, 0, 0)
+	end
+
+	local rightVector = upVector:Cross(arbitraryReferenceVector).Unit
+	local lookVector = rightVector:Cross(upVector).Unit
+
+	return CFrame.fromMatrix(position, rightVector, upVector, lookVector)
+end
+
+-- This function is now much smarter, using the surface normal to validate placement on slopes.
+local function isProperlyGrounded(position: Vector3, normal: Vector3, TerrainMath, config, sizeX, sizeZ, strictlyFlat)
+	-- Epsilon is the allowed vertical distance (in studs) between the ideal slope plane
+	-- and the actual terrain at the corners. Increase this for more rugged terrain.
+	local epsilon = 0.75
+
+	-- 1. Check for overhangs/caves at the center point. This is still a valuable check.
+	-- We can use a larger tolerance here than the original 0.1.
+	local isFloating = math.abs(TerrainMath.getSurfaceHeightAt(position.X, position.Z, config) - TerrainMath.getFloorHeightAt(position.X, position.Z, config)) > 0.5
+	if isFloating then return false end
+
+	-- 2. Define the corner offsets from the center. We use half the size for this.
+	local halfSizeX = sizeX / 2
+	local halfSizeZ = sizeZ / 2
+	local offsets = {
+		Vector3.new(halfSizeX, 0, halfSizeZ),  -- Top-right
+		Vector3.new(-halfSizeX, 0, halfSizeZ), -- Top-left
+		Vector3.new(halfSizeX, 0, -halfSizeZ), -- Bottom-right
+		Vector3.new(-halfSizeX, 0, -halfSizeZ) -- Bottom-left
+	}
+
+	-- Avoid division by zero on vertical cliffs (where normal.Y is close to 0)
+	if math.abs(normal.Y) < 0.01 then return false end
+
+	-- 3. Check each corner against the calculated slope plane.
+	if strictlyFlat then
+		for _, offset in ipairs(offsets) do
+			local cornerWorldPos = position + offset
+
+			-- Get the actual height of the terrain at this corner
+			local actualCornerHeight = TerrainMath.getSurfaceHeightAt(cornerWorldPos.X, cornerWorldPos.Z, config)
+
+			-- Calculate the expected height of the corner on the plane defined by the center point and the normal.
+			-- The formula is derived from the plane equation: normal.X * dx + normal.Y * dy + normal.Z * dz = 0
+			-- We solve for dy: dy = -(normal.X * dx + normal.Z * dz) / normal.Y
+			local expectedHeightOffset = -(normal.X * offset.X + normal.Z * offset.Z) / normal.Y
+			local expectedCornerHeight = position.Y + expectedHeightOffset
+
+			-- If the actual terrain deviates too much from our ideal plane, the ground is too bumpy.
+			if math.abs(actualCornerHeight - expectedCornerHeight) > epsilon then
+				return false
+			end
+		end
+	end
+
+	return true
+end
+
+---
+-- Creates a feature blueprint for a given model at a specific world X,Z coordinate.
+-- @param context A table containing:
+--   .x (number): The world X coordinate.
+--   .z (number): The world Z coordinate.
+--   .ModelData (table): A table containing the model and optional pre-calculated data.
+--      .Model (Model): The model instance to be placed.
+--      .CornersInPivotSpace (table?): Optional. An array of 8 Vector3s representing the OBB corners relative to the pivot. If provided, enables "lowest point" placement.
+--   .TerrainMath (table): The terrain math utility library.
+--   .config (table): The active terrain configuration table.
+--   .Identifier (string?): Optional. A unique string to identify this feature.
+--   .OptionalParams (table?): Optional. A table for extra parameters.
+--      .ApplyRandomYaw (boolean?): If true, applies a deterministic random rotation around the Y-axis.
+--      .Seed (number?): The world seed, required if ApplyRandomYaw is true.
+-- @return A feature blueprint table { Model, CFrame, Identifier }, or nil if no ground is found.
+function FeaturePlacer.createBlueprintAt(context)
+	local x, z = context.x, context.z
+	local modelData = context.ModelData
+	if not modelData then return nil end
+	local model = modelData.Model
+	local TerrainMath = context.TerrainMath
+	local config = context.config
+	local AutoCheckGrounding = (context.AutoCheckGrounding ~= nil and context.AutoCheckGrounding) or true
+	local optionalParams = context.OptionalParams or {}
+
+	-- 1. Find the physical ground height and normal at the given X,Z coordinate.
+	local y = TerrainMath.getFloorHeightAt(x, z, config)
+	if y <= 0 then
+		return nil
+	end
+
+	local normal = TerrainMath.getSurfaceNormalAt(x, z, config)
+	local groundPosition = Vector3.new(x, y, z)
+	
+	if AutoCheckGrounding and not isProperlyGrounded(groundPosition, normal, TerrainMath, config, modelData.Extent.X, modelData.Extent.Z, context.StrictlyFlat) then
+		return nil
+	end
+
+	-- 2. Calculate the base rotation (alignment to surface).
+	local surfaceRotation = getCFrameOnSurface(Vector3.zero, normal).Rotation
+
+	-- 3. Apply optional random yaw rotation.
+	local alignedRotation = surfaceRotation
+	if optionalParams.ApplyRandomYaw then
+		local seed = optionalParams.Seed or 0
+		math.randomseed(seed)
+		local rotationY = math.noise(x / 37, z / 37, seed) * 360
+		local yawRotation = CFrame.Angles(0, math.rad(rotationY), 0)
+		alignedRotation = surfaceRotation * yawRotation
+	end
+
+	-- 4. Determine the final CFrame based on placement mode.
+	local finalCFrame = CFrame.new(groundPosition) * alignedRotation * CFrame.new(0, modelData.Extent.Y/2 - (modelData.EmbedDepth or 0), 0)
+
+	-- 5. Construct and return the blueprint.
+	local identifier = context.Identifier or `{model.Name}:{x},{z}`
+	return {
+		Model = model,
+		CFrame = finalCFrame,
+		Identifier = identifier,
+	}
+end
+
+return FeaturePlacer]]></ProtectedString>
+				<string name="ScriptGuid">{E97B5DDD-7540-4730-890E-7C9212198725}</string>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">FeaturePlacer</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+		</Item>
+		<Item class="Actor" referent="RBX5240AF50CE5C43769116B10D34370ED4">
+			<Properties>
+				<token name="LevelOfDetail">0</token>
+				<CoordinateFrame name="ModelMeshCFrame">
+					<X>0</X>
+					<Y>0</Y>
+					<Z>0</Z>
+					<R00>1</R00>
+					<R01>0</R01>
+					<R02>0</R02>
+					<R10>0</R10>
+					<R11>1</R11>
+					<R12>0</R12>
+					<R20>0</R20>
+					<R21>0</R21>
+					<R22>1</R22>
+				</CoordinateFrame>
+				<SharedString name="ModelMeshData">yuZpQdnvvUBOTYh1jqZ2cA==</SharedString>
+				<Vector3 name="ModelMeshSize">
+					<X>0</X>
+					<Y>0</Y>
+					<Z>0</Z>
+				</Vector3>
+				<token name="ModelStreamingMode">0</token>
+				<bool name="NeedsPivotMigration">false</bool>
+				<Ref name="PrimaryPart">null</Ref>
+				<float name="ScaleFactor">1</float>
+				<SharedString name="SlimHash">yuZpQdnvvUBOTYh1jqZ2cA==</SharedString>
+				<OptionalCoordinateFrame name="WorldPivotData"></OptionalCoordinateFrame>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">ChunkManagerActor</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+			<Item class="Script" referent="RBX39F3A33615DB4164B300B2CB4E857C2F">
+				<Properties>
+					<ProtectedString name="Source"><![CDATA[--!native
+-- SplinearTerrain-Caveless Worker v2.0 (High Performance)
+-- OPTIMIZATION: This worker now pre-calculates height and normal maps for the entire chunk.
+-- This avoids thousands of expensive, redundant noise calls in the main voxel loop,
+-- resulting in a massive performance increase.
+-- REFACTOR: Receives the serialized terrain config for each job, ensuring it always
+-- uses the latest settings without unsafe module re-loading.
+
+local actor = script:GetActor()
+if not actor then return end
+
+-- Load all necessary modules once in a synchronized context.
+-- This is safe because the main server script has already loaded them,
+-- so these calls will just retrieve the cached modules.
+task.synchronize()
+local Root = game:GetService("ServerScriptService").TerrainService
+local Serializer = require(Root.Serializer)
+local TerrainMath = require(Root.TerrainMath)
+local FeatureRegistry = require(Root.FeatureRegistry)
+-- Requiring these modules ensures their classes are hooked into the serializer
+require(Root.Spline)
+require(Root.TerrainConfig.Biome)
+
+local FeaturesFolder = Root.Features
+local FeatureGenerators = {}
+for _, featureModule in ipairs(FeaturesFolder:GetChildren()) do
+	if featureModule:IsA("ModuleScript") then
+		table.insert(FeatureGenerators, require(featureModule))
+	end
+end
+task.desynchronize()
+
+local ceil, max, min, floor = math.ceil, math.max, math.min, math.floor
+
+local function GenerateChunk(chunkX, chunkZ, managerActor, serializedConfig)
+	task.desynchronize()
+
+	-- Each job gets its own deserialized copy of the config
+	local config = Serializer:Deserialize(serializedConfig)
+
+	local CHUNK_SIZE = config.TERRAIN_CHUNK_SIZE
+	local RES = config.VOXEL_RESOLUTION
+	local VOXEL_OFFSET = RES / 2
+
+	-- STAGE 1: GENERATE HEIGHTMAP, MATERIALMAP & WATERMAP
+	local heightmap, materialmap, watermap = {}, {}, {}
+	local maxChunkY, minSolidY = 0, math.huge -- minSolidY initialized high
+
+	for localX = -RES, CHUNK_SIZE + RES, RES do -- Over-sample by 1 voxel for normal calculations
+		heightmap[localX], materialmap[localX], watermap[localX] = {}, {}, {}
+		local worldX = chunkX + localX
+		for localZ = -RES, CHUNK_SIZE + RES, RES do
+			local worldZ = chunkZ + localZ
+			local sampleX, sampleZ = worldX + VOXEL_OFFSET, worldZ + VOXEL_OFFSET
+
+			local finalHeight, surfaceMaterial, waterHeight = TerrainMath.getSurfacePropertiesAt(sampleX, sampleZ, config)
+
+			heightmap[localX][localZ] = finalHeight - VOXEL_OFFSET
+			materialmap[localX][localZ] = surfaceMaterial
+			watermap[localX][localZ] = waterHeight - VOXEL_OFFSET
+
+			if localX >= 0 and localX <= CHUNK_SIZE and localZ >= 0 and localZ <= CHUNK_SIZE then
+				maxChunkY = max(maxChunkY, finalHeight, waterHeight) -- Max height should consider water level
+				-- Removed simplified minSolidY calculation here
+			end
+		end
+	end
+
+	-- STAGE 2: (PERFORMANCE) GENERATE NORMALMAP FROM HEIGHTMAP
+	local normalmap = {}
+	for localX = 0, CHUNK_SIZE, RES do
+		normalmap[localX] = {}
+		for localZ = 0, CHUNK_SIZE, RES do
+			local h_px = heightmap[localX + RES][localZ]
+			local h_nx = heightmap[localX - RES][localZ]
+			local h_pz = heightmap[localX][localZ + RES]
+			local h_nz = heightmap[localX][localZ - RES]
+
+			local normal = Vector3.new(h_nx - h_px, 2 * RES, h_nz - h_pz).Unit
+			normalmap[localX][localZ] = normal
+		end
+	end
+
+	-- STAGE 2.5: DETERMINE MINIMUM SOLID Y (Accurate Floor Estimation using Cave Threshold)
+	for localX = 0, CHUNK_SIZE, RES do
+		for localZ = 0, CHUNK_SIZE, RES do
+			local surfaceHeight = heightmap[localX][localZ] -- (TrueSurfaceHeight - VOXEL_OFFSET)
+			local normal = normalmap[localX][localZ]
+
+			-- Calculate slope (tan(angle from vertical))
+			local slope = math.tan(math.acos(normal.Y))
+
+			-- Get the accurate solid floor Y position using the threshold function
+			local solidFloorY = TerrainMath.getSurfaceCaveThreshold(surfaceHeight, slope)
+
+			minSolidY = min(minSolidY, solidFloorY)
+		end
+	end
+
+	-- STAGE 3: INITIALIZE VOXEL BUFFERS
+	local startY = floor(minSolidY / RES) * RES -- Use the accurately calculated minSolidY
+	local endY = ceil(maxChunkY / RES) * RES
+	local chunkHeight = endY - startY
+
+	if chunkHeight <= 0 then
+		managerActor:SendMessage("ChunkDataReady", chunkX, chunkZ, true, actor, nil, nil, nil, nil)
+		return
+	end
+
+	local sizeX, sizeZ, sizeY = CHUNK_SIZE / RES, CHUNK_SIZE / RES, chunkHeight / RES
+	-- (OPTIMIZATION) Pre-allocate tables to prevent resizing overhead
+	local materials = table.create(sizeX)
+	local occupancy = table.create(sizeX)
+	for x = 1, sizeX do
+		materials[x] = table.create(sizeY)
+		occupancy[x] = table.create(sizeY)
+		for y = 1, sizeY do
+			materials[x][y] = table.create(sizeZ, Enum.Material.Air)
+			occupancy[x][y] = table.create(sizeZ, 0)
+		end
+	end
+
+	-- STAGE 4: POPULATE VOXEL BUFFERS (USING PRE-CALCULATED MAPS)
+	for xIndex = 1, sizeX do
+		local localX = (xIndex - 1) * RES
+		for zIndex = 1, sizeZ do
+			local localZ = (zIndex - 1) * RES
+			local surfaceHeight = heightmap[localX][localZ]
+			local surfaceMaterial = materialmap[localX][localZ]
+			local waterHeight = watermap[localX][localZ]
+			local normal = normalmap[localX][localZ]
+
+			-- (PERFORMANCE) Calculate slope instantly from the pre-calculated normal
+			local slope = math.tan(math.acos(normal.Y))
+			local solidFloorY = TerrainMath.getSurfaceCaveThreshold(surfaceHeight, slope)
+
+			-- Generate solid terrain
+			local yIndexStart = max(1, floor((solidFloorY - startY) / RES) + 1)
+			local ySolidEndIndex = floor((surfaceHeight - startY) / RES)
+
+			for yIndex = yIndexStart, ySolidEndIndex do
+				if yIndex >= 1 and yIndex <= sizeY then
+					occupancy[xIndex][yIndex][zIndex] = 1
+					materials[xIndex][yIndex][zIndex] = surfaceMaterial
+				end
+			end
+
+			-- Generate partial voxel for terrain surface
+			local ySurfaceIndex = ySolidEndIndex + 1
+			if ySurfaceIndex >= 1 and ySurfaceIndex <= sizeY then
+				local yWorldTopOfSolid = startY + ySolidEndIndex * RES
+				local partialOccupancy = (surfaceHeight - yWorldTopOfSolid) / RES
+				occupancy[xIndex][ySurfaceIndex][zIndex] = math.clamp(math.round(partialOccupancy * 8) * 0.125, 0, 1)
+				materials[xIndex][ySurfaceIndex][zIndex] = surfaceMaterial
+			end
+
+			-- Generate water if water level is above the terrain
+			if waterHeight > surfaceHeight then
+				-- Calculate Y indices for water column, starting from the terrain surface
+				local yWaterStartFillIndex = floor((surfaceHeight - startY) / RES) + 1
+				local yWaterSolidEndIndex = floor((waterHeight - startY) / RES)
+
+				-- Fill solid water voxels (this will correctly overwrite the partial terrain surface voxel if necessary)
+				for yIndex = yWaterStartFillIndex, yWaterSolidEndIndex do
+					if yIndex >= 1 and yIndex <= sizeY then
+						occupancy[xIndex][yIndex][zIndex] = 1
+						materials[xIndex][yIndex][zIndex] = Enum.Material.Water
+					end
+				end
+
+				-- Generate partial voxel for water surface
+				local yWaterSurfaceIndex = yWaterSolidEndIndex + 1
+				if yWaterSurfaceIndex >= 1 and yWaterSurfaceIndex <= sizeY then
+					local yWorldTopOfSolidWater = startY + yWaterSolidEndIndex * RES
+					local partialOccupancy = (waterHeight - yWorldTopOfSolidWater) / RES
+					occupancy[xIndex][yWaterSurfaceIndex][zIndex] = math.clamp(math.round(partialOccupancy * 8) * 0.125, 0, 1)
+					materials[xIndex][yWaterSurfaceIndex][zIndex] = Enum.Material.Water
+				end
+			end
+		end
+	end
+
+	-- STAGE 5: FEATURE GENERATION
+	local featureContainers = {}
+	if config.USE_FEATURES and #FeatureGenerators > 0 then
+		local context = { 
+			chunkX = chunkX, 
+			chunkZ = chunkZ, 
+			TerrainMath = TerrainMath, 
+			FeatureRegistry = FeatureRegistry,
+			config = config -- Pass the deserialized config to feature generators
+		}
+		for _, generator in ipairs(FeatureGenerators) do
+			local container = generator.Generate(context)
+			if container and #container > 0 then table.insert(featureContainers, container) end
+		end
+	end
+
+	-- STAGE 6: REPORT COMPLETION
+	local corner = Vector3.new(chunkX, startY, chunkZ)
+	local regionSize = Vector3.new(CHUNK_SIZE, chunkHeight, CHUNK_SIZE)
+	local region = Region3.new(corner, corner + regionSize):ExpandToGrid(RES)
+	local writeData = { region = region, resolution = RES, materials = materials, occupancy = occupancy }
+
+	managerActor:SendMessage("ChunkDataReady", chunkX, chunkZ, false, actor, nil, nil, featureContainers, writeData)
+end
+
+actor:BindToMessageParallel("GenerateChunk", GenerateChunk)]]></ProtectedString>
+					<bool name="Disabled">true</bool>
+					<Content name="LinkedSource"><null></null></Content>
+					<token name="RunContext">0</token>
+					<string name="ScriptGuid">{17A537D9-118D-4B09-AF05-24784AF68E87}</string>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">TerrainWorker</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+		</Item>
+		<Item class="Folder" referent="RBXA9476DD1FD0B45DFA8749BB26A9903B9">
+			<Properties>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">Features</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+			<Item class="Folder" referent="RBX11C73FDF00EC43C7BC18A7945D8EA21F">
+				<Properties>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">Disabled</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+				<Item class="ModuleScript" referent="RBXDA31A46B1F574FA782C01760B846AF28">
+					<Properties>
+						<Content name="LinkedSource"><null></null></Content>
+						<ProtectedString name="Source"><![CDATA[--!native
+-- TreeGenerator v5.1 (Config-Decoupled)
+-- This version is adapted for the SplinearTerrain-Caveless system.
+-- It receives the active terrain configuration from the worker's context.
+
+local Root = script.Parent.Parent
+local FeaturePlacer = require(Root.FeaturePlacer)
+
+local TreeGenerator = {}
+
+local GRID_SIZE = 8
+local JITTER_STRENGTH = 20
+local SPARSE_CHANCE = 0.03
+
+-- Tree types and rules are updated for the new world logic
+local TREE_TYPES = {
+	{ 
+		Name = "Oak", 
+		FolderName = "Oaks", 
+		NoiseSettings = { SeedOffset = 7000 },
+		ForestNoise = { Frequency = 30, Threshold = 0.3 }, 
+		PlacementRules = { 
+			MaxDensity = 0.8, 
+			AllowedMaterials = {[Enum.Material.Grass] = true, [Enum.Material.LeafyGrass] = true}, -- Oaks grow on grass
+			MinHeight = 0, 
+			MaxHeight = 200, -- Found in lower, gentle areas
+			MaxSlope = 0.5, 
+		}, 
+	},
+	{ 
+		Name = "Pine", 
+		FolderName = "Pines", 
+		NoiseSettings = { SeedOffset = 5000 }, 
+		ForestNoise = { Frequency = 30, Threshold = 0.3 }, 
+		PlacementRules = { 
+			MaxDensity = 0.8, 
+			AllowedMaterials = {[Enum.Material.Grass] = true, [Enum.Material.LeafyGrass] = true}, -- Pines grow on rocky slopes
+			MinHeight = 0, -- Found at higher, rockier elevations
+			MaxHeight = 300,
+			MaxSlope = 0.5, 
+		}, 
+	},
+}
+
+-- Asset loading logic remains unchanged...
+local ServerStorage = game:GetService("ServerStorage")
+local AssetsFolder = ServerStorage:WaitForChild("Assets")
+local TreesRootFolder = AssetsFolder:FindFirstChild("Trees")
+local TREE_ASSETS_MAP = {} 
+if TreesRootFolder then
+	for _, treeInfo in ipairs(TREE_TYPES) do
+		local treeCategoryFolder = TreesRootFolder:FindFirstChild(treeInfo.FolderName)
+		if not treeCategoryFolder then continue end
+		local models = treeCategoryFolder:GetChildren()
+		if #models <= 0 then continue end
+		TREE_ASSETS_MAP[treeInfo.Name] = {}
+		for _, v in ipairs(models) do
+			table.insert(TREE_ASSETS_MAP[treeInfo.Name], { Model = v, Extent = v:GetExtentsSize() })
+		end
+	end
+end
+
+
+function TreeGenerator.Generate(context)
+	local config = context.config -- Get config from context
+	local CHUNK_SIZE, SEED = config.TERRAIN_CHUNK_SIZE, config.SEED
+	local chunkX, chunkZ = context.chunkX, context.chunkZ
+	local TerrainMath = context.TerrainMath
+	local featureBlueprints = {}
+	local MARGIN = JITTER_STRENGTH
+	
+	math.randomseed(SEED)
+
+	for x = chunkX - MARGIN, chunkX + CHUNK_SIZE + MARGIN, GRID_SIZE do
+		for z = chunkZ - MARGIN, chunkZ + CHUNK_SIZE + MARGIN, GRID_SIZE do
+			local offsetX = (math.noise(x, z, 0.7 * SEED + 1) * 2 - 1) * JITTER_STRENGTH
+			local offsetZ = (math.noise(x, z, 0.5 * SEED + 2) * 2 - 1) * JITTER_STRENGTH
+			local finalX, finalZ = x + offsetX, z + offsetZ
+
+			if finalX >= chunkX and finalX < chunkX + CHUNK_SIZE and finalZ >= chunkZ and finalZ < chunkZ + CHUNK_SIZE then
+				for _, treeInfo in ipairs(TREE_TYPES) do
+					local modelsData = TREE_ASSETS_MAP[treeInfo.Name]
+					if not modelsData or #modelsData == 0 then continue end
+
+					local noiseInputX = finalX / treeInfo.ForestNoise.Frequency
+					local noiseInputZ = finalZ / treeInfo.ForestNoise.Frequency
+					local forestNoise = (math.noise(noiseInputX, noiseInputZ, SEED + treeInfo.NoiseSettings.SeedOffset) + 1) / 2
+					local isForestArea = forestNoise >= treeInfo.ForestNoise.Threshold
+					local finalChance = isForestArea and ((forestNoise - treeInfo.ForestNoise.Threshold) / (1 - treeInfo.ForestNoise.Threshold) * treeInfo.PlacementRules.MaxDensity) or SPARSE_CHANCE
+					if finalChance <= 0 then continue end
+
+					-- Pass config to TerrainMath functions
+					local accurateHeight, material = TerrainMath.getSurfacePropertiesAt(finalX, finalZ, config)
+					local normal = TerrainMath.getSurfaceNormalAt(finalX, finalZ, config)
+
+					if accurateHeight <= 0 then continue end
+					if not treeInfo.PlacementRules.AllowedMaterials[material] then continue end
+					if accurateHeight < treeInfo.PlacementRules.MinHeight or accurateHeight > treeInfo.PlacementRules.MaxHeight then continue end
+					if math.tan(math.acos(normal.Unit.Y)) > treeInfo.PlacementRules.MaxSlope then continue end
+
+					local gridX, gridZ = math.floor(x / GRID_SIZE), math.floor(z / GRID_SIZE)
+					local placementHash = (math.noise(gridX * 13.73, gridZ * 29.51, SEED + treeInfo.NoiseSettings.SeedOffset) + 1) / 2
+					if placementHash > finalChance then continue end
+
+					local identifier = `Tree:{treeInfo.Name}:{x},{z}`
+					if context.FeatureRegistry:IsDestroyed(identifier) then continue end
+
+					local modelIndex = math.floor((math.noise(x * 0.4, z * 0.2, SEED + 3) + 1) / 2 * #modelsData) + 1
+					local treeData = modelsData[modelIndex]
+
+					local blueprint = FeaturePlacer.createBlueprintAt({
+						x = finalX,
+						z = finalZ,
+						ModelData = treeData,
+						TerrainMath = context.TerrainMath,
+						config = config, -- Pass config to FeaturePlacer
+						Identifier = identifier,
+						OptionalParams = { ApplyRandomYaw = true, Seed = SEED },
+						StrictlyFlat = false
+					})
+
+					if blueprint then
+						table.insert(featureBlueprints, blueprint)
+					end
+					break 
+				end
+			end
+		end
+	end
+	return featureBlueprints
+end
+
+return TreeGenerator]]></ProtectedString>
+						<string name="ScriptGuid">{AC0784B1-3D86-4206-83C5-71A1FBABEB3A}</string>
+						<BinaryString name="AttributesSerialize"></BinaryString>
+						<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+						<bool name="DefinesCapabilities">false</bool>
+						<string name="Name">TreeGenerator</string>
+						<int64 name="SourceAssetId">-1</int64>
+						<BinaryString name="Tags"></BinaryString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX21E8CF8C568B4AB6B69A151CF943FE7E">
+					<Properties>
+						<Content name="LinkedSource"><null></null></Content>
+						<ProtectedString name="Source"><![CDATA[--!native
+-- VillageGenerator v5.1 (Config-Decoupled)
+-- This version is fully procedural and adapted for the SplinearTerrain system.
+-- It receives the active terrain configuration from the worker's context.
+
+local Root = script.Parent.Parent
+local FeaturePlacer = require(Root.FeaturePlacer)
+
+local VillageGenerator = {}
+
+-- Village types now use AllowedMaterials instead of AllowedBiomes
+local VILLAGE_TYPES = {
+	{ 
+		Name = "PlainsVillage", 
+		AllowedMaterials = { [Enum.Material.Grass] = true }, -- Villages on grassy plains
+		VillageNoise = { Frequency = 0.01, Threshold = 0.4 }, -- Villages are somewhat rare
+		LayoutGridSize = 40, 
+		JitterStrength = 15, 
+		HouseChance = 0.75, 
+		PropChance = 0.5, 
+		PlacementRules = { MinHeight = 0, MaxHeight = 50, MaxSlopeNormalY = 0.98 }, -- Require very flat ground
+	},
+	{ 
+		Name = "DesertOasis", 
+		AllowedMaterials = { [Enum.Material.Sand] = true }, -- Oases on sand
+		VillageNoise = { Frequency = 0.01, Threshold = 0.45 }, -- Even rarer
+		LayoutGridSize = 70, 
+		JitterStrength = 20, 
+		HouseChance = 0.4, 
+		PropChance = 0.6, 
+		PlacementRules = { MinHeight = 0, MaxHeight = 40, MaxSlopeNormalY = 0.99 }, -- Must be extremely flat
+	},
+}
+
+-- Asset loading logic remains unchanged...
+local OCCUPANCY_GRID_CELL_SIZE = 20
+local ServerStorage = game:GetService("ServerStorage")
+local AssetsFolder = ServerStorage:WaitForChild("Assets")
+local VillagesRootFolder = AssetsFolder:FindFirstChild("Villages")
+local VILLAGE_DATA_MAP, VILLAGE_TYPE_MAP = {}, {}
+local function loadAssets()
+	if not VillagesRootFolder then return end
+	for _, villageInfo in ipairs(VILLAGE_TYPES) do
+		local villageName = villageInfo.Name
+		VILLAGE_TYPE_MAP[villageName] = villageInfo
+		local villageFolder = VillagesRootFolder:FindFirstChild(villageName)
+		if villageFolder then
+			VILLAGE_DATA_MAP[villageName] = { Houses = {}, Props = {} }
+			for _, category in ipairs({"Houses", "Props"}) do
+				local categoryFolder = villageFolder:FindFirstChild(category)
+				if categoryFolder then
+					for _, model in ipairs(categoryFolder:GetChildren()) do
+						if model:IsA("Model") then
+							table.insert(VILLAGE_DATA_MAP[villageName][category], { Model = model, Extent = model:GetExtentsSize() })
+						end
+					end
+				end
+			end
+		end
+	end
+end
+loadAssets()
+
+
+function VillageGenerator.Generate(context)
+	local config = context.config -- Get config from context
+	local SEED = config.SEED
+	local chunkX, chunkZ = context.chunkX, context.chunkZ
+	local TerrainMath = context.TerrainMath
+	local featureBlueprints = {}
+	local occupancyGrid = {}
+	
+	math.randomseed(SEED)
+
+	-- This helper function is largely the same, but it's now the only placement method.
+	local function tryPlaceStructureAt(x, z, finalX, finalZ, villageInfo)
+		local assetsData = VILLAGE_DATA_MAP[villageInfo.Name]
+		local rules = villageInfo.PlacementRules
+
+		-- Pass config to TerrainMath functions
+		local accurateHeight, material = TerrainMath.getSurfacePropertiesAt(finalX, finalZ, config)
+		local normal = TerrainMath.getSurfaceNormalAt(finalX, finalZ, config)
+
+		if not villageInfo.AllowedMaterials[material] then return false end
+		if accurateHeight < rules.MinHeight or accurateHeight > rules.MaxHeight then return false end
+		if normal.Y < rules.MaxSlopeNormalY then return false end
+
+		local placementHash = (math.noise(x * 13.71, z * 29.53, SEED + 9003) + 1) * 0.5
+		local placementType = (placementHash < villageInfo.HouseChance and "Houses") or (placementHash < villageInfo.HouseChance + villageInfo.PropChance and "Props") or nil
+
+		if placementType then
+			local assetDataList = assetsData[placementType]
+			if #assetDataList == 0 then return false end
+			local identifier = `Village:{villageInfo.Name}:{placementType}:{x},{z}`
+			if context.FeatureRegistry:IsDestroyed(identifier) then return false end
+
+			local modelSeed = (placementType == "Houses") and (SEED + 9004) or (SEED + 9006)
+			local modelHash = (math.noise(x * 53.17, z * 89.71, modelSeed) + 1) * 0.5
+			local modelIndex = 1 + math.floor(modelHash * #assetDataList) % #assetDataList
+			local modelData = assetDataList[modelIndex]
+
+			local rotationHash = (math.noise(x * 0.47, z * 0.83, SEED + 9005) + 1) * 0.5
+			local gridRotation = math.floor(rotationHash * 4) * 90
+
+			-- Occupancy grid logic remains critical and unchanged
+			local obbSize = modelData.Extent
+			local targetRotation = CFrame.Angles(0, math.rad(gridRotation), 0)
+			local halfSize = obbSize / 2
+			local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+			for sx = -1, 1, 2 do for sz = -1, 1, 2 do local c = targetRotation * Vector3.new(sx*halfSize.X, 0, sz*halfSize.Z) minX, maxX, minZ, maxZ = math.min(minX, c.X), math.max(maxX, c.X), math.min(minZ, c.Z), math.max(maxZ, c.Z) end end
+			local startGx, endGx = math.floor((finalX + minX) / OCCUPANCY_GRID_CELL_SIZE), math.floor((finalX + maxX) / OCCUPANCY_GRID_CELL_SIZE)
+			local startGz, endGz = math.floor((finalZ + minZ) / OCCUPANCY_GRID_CELL_SIZE), math.floor((finalZ + maxZ) / OCCUPANCY_GRID_CELL_SIZE)
+			for gx = startGx, endGx do for gz = startGz, endGz do if occupancyGrid[gx] and occupancyGrid[gx][gz] then return false end end end
+			for gx = startGx, endGx do if not occupancyGrid[gx] then occupancyGrid[gx] = {} end for gz = startGz, endGz do occupancyGrid[gx][gz] = true end end
+
+			local blueprint = FeaturePlacer.createBlueprintAt({
+				x = finalX, z = finalZ, ModelData = modelData, TerrainMath = context.TerrainMath, config = config, Identifier = identifier,
+				OptionalParams = { Yaw = math.rad(gridRotation), Seed = SEED }, StrictlyFlat = true
+			})
+
+			if blueprint then
+				table.insert(featureBlueprints, blueprint)
+				return true
+			end
+		end
+		return false
+	end
+
+	-- The generator is 100% procedural.
+	for _, villageInfo in ipairs(VILLAGE_TYPES) do
+		local layoutGridSize, margin = villageInfo.LayoutGridSize, villageInfo.JitterStrength + villageInfo.LayoutGridSize
+		for x = chunkX - margin, chunkX + config.TERRAIN_CHUNK_SIZE + margin, layoutGridSize do
+			for z = chunkZ - margin, chunkZ + config.TERRAIN_CHUNK_SIZE + margin, layoutGridSize do
+				local villageNoise = (math.noise(x * villageInfo.VillageNoise.Frequency, z * villageInfo.VillageNoise.Frequency, SEED + 9000) + 1) * 0.5
+				if villageNoise < villageInfo.VillageNoise.Threshold then continue end
+
+				local offsetX = (math.noise(x * 0.23, z * 0.61, SEED * 0.6 + 9001) * 2 - 1) * villageInfo.JitterStrength
+				local offsetZ = (math.noise(x * 0.31, z * 0.73, SEED * 0.7 + 9002) * 2 - 1) * villageInfo.JitterStrength
+				local finalX, finalZ = x + offsetX, z + offsetZ
+
+				if finalX >= chunkX and finalX < chunkX + config.TERRAIN_CHUNK_SIZE and finalZ >= chunkZ and finalZ < chunkZ + config.TERRAIN_CHUNK_SIZE then
+					tryPlaceStructureAt(x, z, finalX, finalZ, villageInfo)
+				end
+			end
+		end
+	end
+
+	return featureBlueprints
+end
+
+return VillageGenerator]]></ProtectedString>
+						<string name="ScriptGuid">{04017D57-5BB1-48E8-AB54-0863E017E577}</string>
+						<BinaryString name="AttributesSerialize"></BinaryString>
+						<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+						<bool name="DefinesCapabilities">false</bool>
+						<string name="Name">VillageGenerator</string>
+						<int64 name="SourceAssetId">-1</int64>
+						<BinaryString name="Tags"></BinaryString>
+					</Properties>
+				</Item>
+			</Item>
+			<Item class="ModuleScript" referent="RBXE0AD19B8A8674796841134FB129FBB0B">
+				<Properties>
+					<Content name="LinkedSource"><null></null></Content>
+					<ProtectedString name="Source"><![CDATA[--!native
+-- FlowerGenerator v2.1 (Config-Decoupled)
+-- This version is adapted for the SplinearTerrain-Caveless system.
+-- It receives the active terrain configuration from the worker's context.
+
+local Root = script.Parent.Parent
+local FeaturePlacer = require(Root.FeaturePlacer)
+
+local FlowerGenerator = {}
+
+-- Configuration and asset loading
+local GRID_SIZE = 5
+local JITTER_STRENGTH = 15
+local FLOWER_TYPES = {
+	{ 
+		Name = "WildFlowers", 
+		FolderName = "Default", 
+		NoiseSettings = { SeedOffset = 8000 }, 
+		FlowerNoise = { Frequency = 100, Threshold = 0.25 }, 
+		PlacementRules = { 
+			MaxDensity = 0.8, 
+			AllowedMaterials = {[Enum.Material.Grass] = true}, 
+			MinHeight = 1, 
+			MaxHeight = 200, 
+			MaxSlope = 3,
+		}, 
+	},
+}
+
+-- Asset loading logic remains unchanged...
+local ServerStorage = game:GetService("ServerStorage")
+local AssetsFolder = ServerStorage:WaitForChild("Assets")
+local FlowersRootFolder = AssetsFolder:FindFirstChild("Flowers") 
+local FLOWER_ASSETS_MAP = {} 
+if FlowersRootFolder then
+	for _, flowerInfo in ipairs(FLOWER_TYPES) do
+		local flowerCategoryFolder = FlowersRootFolder:FindFirstChild(flowerInfo.FolderName)
+		if not flowerCategoryFolder then continue end
+		local models = flowerCategoryFolder:GetChildren()
+		if #models <= 0 then continue end
+		FLOWER_ASSETS_MAP[flowerInfo.Name] = {}
+		for _, v in ipairs(models) do
+			table.insert(FLOWER_ASSETS_MAP[flowerInfo.Name], { Model = v, Extent = v:GetExtentsSize() })
+		end
+	end
+end
+
+
+function FlowerGenerator.Generate(context)
+	local config = context.config -- Get config from context
+	local CHUNK_SIZE, SEED = config.TERRAIN_CHUNK_SIZE, config.SEED
+	local chunkX, chunkZ = context.chunkX, context.chunkZ
+	local TerrainMath = context.TerrainMath 
+	local featureBlueprints = {}
+	local MARGIN = JITTER_STRENGTH
+	
+	math.randomseed(SEED)
+
+	for x = chunkX - MARGIN, chunkX + CHUNK_SIZE + MARGIN, GRID_SIZE do
+		for z = chunkZ - MARGIN, chunkZ + CHUNK_SIZE + MARGIN, GRID_SIZE do
+			local offsetX = (math.noise(0.2 * x, -0.82 * z, 0.7 * SEED + 1) * 2 - 1) * JITTER_STRENGTH
+			local offsetZ = (math.noise(0.3 * x, 0.1235 * z, 0.5 * SEED + 2) * 2 - 1) * JITTER_STRENGTH
+			local finalX, finalZ = x + offsetX, z + offsetZ
+
+			if finalX >= chunkX and finalX < chunkX + CHUNK_SIZE and finalZ >= chunkZ and finalZ < chunkZ + CHUNK_SIZE then
+				for _, flowerInfo in ipairs(FLOWER_TYPES) do
+					local modelsData = FLOWER_ASSETS_MAP[flowerInfo.Name]
+					if not modelsData or #modelsData == 0 then continue end
+
+					local fieldNoise = (math.noise(finalX / flowerInfo.FlowerNoise.Frequency, finalZ / flowerInfo.FlowerNoise.Frequency, SEED + flowerInfo.NoiseSettings.SeedOffset) + 1) / 2
+					if fieldNoise < flowerInfo.FlowerNoise.Threshold then continue end
+
+					-- Pass config to TerrainMath functions
+					local accurateHeight, material = TerrainMath.getSurfacePropertiesAt(finalX, finalZ, config)
+					local normal = TerrainMath.getSurfaceNormalAt(finalX, finalZ, config)
+
+					if accurateHeight <= 0 then continue end
+					if not flowerInfo.PlacementRules.AllowedMaterials[material] then continue end
+					if accurateHeight < flowerInfo.PlacementRules.MinHeight or accurateHeight > flowerInfo.PlacementRules.MaxHeight then continue end
+					if math.tan(math.acos(normal.Unit.Y)) > flowerInfo.PlacementRules.MaxSlope then continue end
+
+					local gridX, gridZ = math.floor(x / GRID_SIZE), math.floor(z / GRID_SIZE)
+					local localDensity = (fieldNoise - flowerInfo.FlowerNoise.Threshold) / (1 - flowerInfo.FlowerNoise.Threshold)
+					local finalChance = localDensity * flowerInfo.PlacementRules.MaxDensity
+					local placementHash = (math.noise(gridX * 13.73, gridZ * 29.51, SEED + flowerInfo.NoiseSettings.SeedOffset) + 1) / 2
+					if placementHash > finalChance then continue end
+
+					local identifier = `Flower:{flowerInfo.Name}:{x},{z}`
+					if context.FeatureRegistry:IsDestroyed(identifier) then continue end
+
+					local modelIndex = math.floor((math.noise(x * 0.3, z * 0.5, SEED + 3) + 1) / 2 * #modelsData) + 1
+					local flowerData = modelsData[modelIndex]
+
+					local blueprint = FeaturePlacer.createBlueprintAt({
+						x = finalX,
+						z = finalZ,
+						ModelData = flowerData,
+						TerrainMath = context.TerrainMath,
+						config = config, -- Pass config to FeaturePlacer
+						Identifier = identifier,
+						OptionalParams = { ApplyRandomYaw = true, Seed = SEED }
+					})
+
+					if blueprint then
+						table.insert(featureBlueprints, blueprint)
+					end
+					break
+				end
+			end
+		end
+	end
+	return featureBlueprints
+end
+
+return FlowerGenerator]]></ProtectedString>
+					<string name="ScriptGuid">{2ED8C38E-ABD2-408C-9E39-123879AFBB1D}</string>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">FlowerGenerator</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+		</Item>
+		<Item class="ModuleScript" referent="RBX6B4BD24EDCA5495D99FB2FBAFF5681B2">
+			<Properties>
+				<Content name="LinkedSource"><null></null></Content>
+				<ProtectedString name="Source"><![CDATA[--!native
+-- Spline Module v1.2
+-- Fixed a critical memory leak by preventing temporary, blended splines from being cached.
+
+local Spline = {}
+Spline.__index = Spline
+Spline.__className = "Spline"
+
+export type SplineObject<T> = typeof(Spline.new())
+
+local InterpolationFunctions = {
+	-- This is the default linear interpolation
+	default = function(a, b, t)
+		return (1 - t) * a + t * b
+	end,
+
+	-- We can add more in the future, e.g., 'stepped'
+	cubicLerp = function(a, b, t)
+		return a + (b - a) * (3 * t^2 - 2 * t^3)
+	end,
+
+	discreteInterpolation = function(a, b, t)
+		return (t < 0.5) and a or b
+	end,
+	
+	blendBiome = function(biomeA, biomeB, t)
+		task.synchronize()
+		local Biome = require(script.Parent.TerrainConfig.Biome)
+		task.desynchronize()
+		return Biome.Blend(biomeA, biomeB, t, math.lerp, function(a, b, t)
+			return (t < 0.5) and a or b
+		end)
+	end
+}
+
+-- This cache is now only used for permanent splines (e.g., those in TerrainConfig).
+local Cache: {[SplineObject<any>]: {any}} = {}
+setmetatable(Cache, {__mode = "k"})
+
+local function rawBinarySearch(A: {number}, v: number): (number, boolean)
+	local l, r = 1, #A
+
+	while l <= r do
+		local m = (l + r)//2
+
+		if A[m] < v then
+			l = m + 1
+		else
+			r = m - 1
+		end
+	end
+
+	return l, A[l] == v
+end
+
+function Spline.defaultFn(a: T, b: T, t: number): T
+	return (1-t)*a+t*b
+end
+	
+	
+function Spline.new<T>(keypoints: {[number]: T}, interpolationName: string?)
+	local self = setmetatable({}, Spline)
+	self.Keypoints = keypoints
+
+	-- Store the NAME (string), not the FUNCTION. This is serializable.
+	self.InterpolationName = interpolationName or "default"
+
+	-- You could add a check here to ensure the name is valid
+	if not InterpolationFunctions[self.InterpolationName] then
+		warn("Invalid interpolationName:", self.InterpolationName, "- falling back to 'default'")
+		self.InterpolationName = "default"
+	end
+
+	Cache[self] = {}
+	return self
+end
+
+function Spline.Blend(splineA: SplineObject, splineB: SplineObject, t: number, interpolationFn: (T, T, number) -> (T)?)
+	-- Handle cases where one or both splines might not exist
+	if not splineA and not splineB then
+		return nil
+	elseif not splineA then
+		return splineB
+	elseif not splineB then
+		return splineA
+	end
+
+	-- 1. Get the union of all keys from both splines
+	local allKeysSet = {}
+	for k in pairs(splineA.Keypoints) do
+		allKeysSet[k] = true
+	end
+	for k in pairs(splineB.Keypoints) do
+		allKeysSet[k] = true
+	end
+
+	local sortedKeys = {}
+	for k in pairs(allKeysSet) do
+		table.insert(sortedKeys, k)
+	end
+	table.sort(sortedKeys)
+
+	-- 2. Create new keypoints by sampling and blending
+	local newKeypoints = {}
+
+	for _, key in ipairs(sortedKeys) do
+		local valueA = splineA:Get(key)
+		local valueB = splineB:Get(key)
+
+		local isNumeric = typeof(valueA) == "number"
+
+		local blendedValue
+		if isNumeric then
+			-- Linear interpolation for numeric values
+			blendedValue = typeof(interpolationFn) == "function" and interpolationFn(valueA, valueB, t) or (1 - t) * valueA + t * valueB
+		else
+			-- Stepped interpolation for discrete values (like Enums)
+			-- If t is closer to 0, use A; if closer to 1, use B.
+			blendedValue = typeof(interpolationFn) == "function" and interpolationFn(valueA, valueB, t) or ((t < 0.5) and valueA or valueB)
+		end
+
+		newKeypoints[key] = blendedValue
+	end
+
+	-- 3. Create the new spline, preserving the interpolation style
+	return Spline.new(newKeypoints, splineA.InterpolationName)
+end
+
+function Spline:GetKeypointKeysAndValues(): ({number}, {T})
+	-- If this spline is cached, check for the pre-calculated KV pair first.
+	if Cache[self] and Cache[self].KV then
+		return Cache[self].KV.K, Cache[self].KV.V
+	end
+
+	-- If not cached or KV pair doesn't exist, calculate it now.
+	local keys = {}
+	for k, _ in self.Keypoints do
+		table.insert(keys, k)
+	end
+	table.sort(keys)
+
+	local values = {}
+	for _, k in keys do
+		table.insert(values, self.Keypoints[k])
+	end
+
+	-- If this spline is meant to be cached, store the result for next time.
+	if Cache[self] then
+		Cache[self].KV = {K = keys, V = values}
+	end
+
+	return keys, values
+end
+
+-- MODIFIED Spline:Get function
+function Spline:Get(number: number): T
+	local keys, values = self:GetKeypointKeysAndValues()
+
+	local index, valid = rawBinarySearch(keys, number)
+	if valid then
+		return values[index]
+	end
+
+	local priorIndex = index-1
+	local previous, current = values[priorIndex], values[index]
+
+	if previous == nil then
+		return current
+	elseif current == nil then
+		return previous
+	end
+
+	local priorKey = keys[priorIndex]
+	local t = (number - priorKey)/(keys[index] - priorKey)
+
+	-- Look up the function from the registry using the stored name
+	local interpolationFn = InterpolationFunctions[self.InterpolationName]
+
+	return interpolationFn(previous, current, t)
+end
+
+function Spline:GetBounds(): (number, number)
+	local _, values = self:GetKeypointKeysAndValues()
+	if typeof(values[1]) ~= "number" then return nil, nil end
+	return math.min(table.unpack(values)), math.max(table.unpack(values))
+end
+
+function Spline:Multiply(scale: number): SplineObject
+	local _, values = self:GetKeypointKeysAndValues()
+	if typeof(values[1]) ~= "number" then return self end
+
+	for k, _ in self.Keypoints do
+		self.Keypoints[k] *= scale
+	end
+
+	-- If this spline is cached, clear its KV pair so it gets recalculated.
+	if Cache[self] then
+		Cache[self].KV = nil
+	end
+
+	return self
+end
+
+Spline.__call = function(self, number: number)
+	return self:Get(number)
+end
+
+local Serializer = require(script.Parent.Serializer)
+Serializer:HookToSerializer(Spline)
+
+return Spline]]></ProtectedString>
+				<string name="ScriptGuid">{0DF2BAF6-80CE-458E-A747-64064D8E435C}</string>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">Spline</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+		</Item>
+		<Item class="Actor" referent="RBXF4D7D743BC7A4678A9719DABCAFB7C4A">
+			<Properties>
+				<token name="LevelOfDetail">0</token>
+				<CoordinateFrame name="ModelMeshCFrame">
+					<X>0</X>
+					<Y>0</Y>
+					<Z>0</Z>
+					<R00>1</R00>
+					<R01>0</R01>
+					<R02>0</R02>
+					<R10>0</R10>
+					<R11>1</R11>
+					<R12>0</R12>
+					<R20>0</R20>
+					<R21>0</R21>
+					<R22>1</R22>
+				</CoordinateFrame>
+				<SharedString name="ModelMeshData">yuZpQdnvvUBOTYh1jqZ2cA==</SharedString>
+				<Vector3 name="ModelMeshSize">
+					<X>0</X>
+					<Y>0</Y>
+					<Z>0</Z>
+				</Vector3>
+				<token name="ModelStreamingMode">0</token>
+				<bool name="NeedsPivotMigration">false</bool>
+				<Ref name="PrimaryPart">null</Ref>
+				<float name="ScaleFactor">1</float>
+				<SharedString name="SlimHash">yuZpQdnvvUBOTYh1jqZ2cA==</SharedString>
+				<OptionalCoordinateFrame name="WorldPivotData"></OptionalCoordinateFrame>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">Relay</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+			<Item class="Script" referent="RBX7A84373C1E7A41FC98262F5FACB057D4">
+				<Properties>
+					<ProtectedString name="Source"><![CDATA[task.synchronize()
+local HostActor: Actor = script.Parent
+local SingleToSingle: BindableEvent = HostActor.SingleToSingle
+local Register: BindableEvent = HostActor.Register
+
+Register.Event:Connect(function(listenName: string)
+	HostActor:BindToMessage(listenName, function(...: any)
+		SingleToSingle:Fire(listenName, ...)
+	end)
+	
+	SingleToSingle:Fire()
+end)]]></ProtectedString>
+					<bool name="Disabled">false</bool>
+					<Content name="LinkedSource"><null></null></Content>
+					<token name="RunContext">0</token>
+					<string name="ScriptGuid">{B80E999E-424C-44DC-B7C8-49C478D34EE8}</string>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">Script</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+			<Item class="BindableEvent" referent="RBXBD4D0A4702A4460B85A2633EC8C464B1">
+				<Properties>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">SingleToSingle</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+			<Item class="BindableEvent" referent="RBXA60480CB2593465799CE660238683C5D">
+				<Properties>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">Register</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+		</Item>
+		<Item class="ModuleScript" referent="RBX381313F2BCB247509B268831468977CC">
+			<Properties>
+				<Content name="LinkedSource"><null></null></Content>
+				<ProtectedString name="Source"><![CDATA[--[[
+	TerrainAPI v2.0
+	Public-facing API for interacting with the TerrainService.
+	- Adds GetTerrainConfig() to retrieve the active configuration table.
+	- Adds SetTerrainConfig(newConfig) to update the world generation settings live.
+]]
+
+local TerrainService = script.Parent:WaitForChild("TerrainService")
+local ApiFolder = TerrainService:WaitForChild("Api")
+
+local GetChunkStateBindable = ApiFolder:WaitForChild("GetChunkState")
+local ForceLoadChunksBindable = ApiFolder:WaitForChild("ForceLoadChunksAtPosition")
+local GetTerrainConfigBindable = ApiFolder:WaitForChild("GetTerrainConfig")
+local SetTerrainConfigBindable = ApiFolder:WaitForChild("SetTerrainConfig")
+
+local TerrainAPI = {}
+
+--- Returns the current state of the chunk containing the given world position.
+-- @param position Vector3
+-- @return string ("Loaded", "Generating", "Unloaded", "Empty", etc.)
+function TerrainAPI.GetChunkState(position: Vector3): string
+	return GetChunkStateBindable:Invoke(position)
+end
+
+--- Checks if the chunk at a given position is fully loaded and ready.
+-- @param position Vector3
+-- @return boolean
+function TerrainAPI.IsPositionLoaded(position: Vector3): boolean
+	local state = TerrainAPI.GetChunkState(position)
+	return state == "Loaded" or state == "Empty"
+end
+
+--- Requests that chunks in a radius around a position be loaded with high priority.
+-- Calls the onComplete callback function once all requested chunks are physically loaded.
+-- @param position Vector3 -- The center of the area to load.
+-- @param radiusInChunks number -- The radius in chunks (0 = 1x1, 1 = 3x3, etc.)
+-- @param onCompleteCallback function -- The function to execute when loading is finished.
+function TerrainAPI.ForceLoadChunks(position: Vector3, radiusInChunks: number, onCompleteCallback: () -> ())
+	-- We use task.spawn because the OnInvoke on the other side will not yield.
+	-- The callback is managed internally by the ChunkManager's force load system.
+	task.spawn(function()
+		ForceLoadChunksBindable:Invoke(position, radiusInChunks, onCompleteCallback)
+	end)
+end
+
+--- Returns a deep copy of the currently active terrain configuration table.
+-- @return table
+function TerrainAPI.GetTerrainConfig(): table
+	return GetTerrainConfigBindable:Invoke()
+end
+
+--- Sets a new terrain configuration. The change will be replicated and used for all
+-- subsequently generated chunks.
+-- @param newConfig table -- The new configuration table. Must be serializable.
+function TerrainAPI.SetTerrainConfig(newConfig: table)
+	if type(newConfig) == "table" then
+		SetTerrainConfigBindable:Fire(newConfig)
+	else
+		warn("[TerrainAPI] SetTerrainConfig requires a table argument.")
+	end
+end
+
+
+return TerrainAPI]]></ProtectedString>
+				<string name="ScriptGuid">{242C89FB-F5E8-43D3-B715-DD0A5DB43A8A}</string>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">TerrainAPI</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+		</Item>
+		<Item class="Folder" referent="RBX8C07D9E92CC248528609E01036C1D0FD">
+			<Properties>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">Api</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+			<Item class="BindableFunction" referent="RBX305D52C399664DAAABC16438D5E8524C">
+				<Properties>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">GetChunkState</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+			<Item class="BindableFunction" referent="RBX1DF7B78FAE8440FDA3776300FF3C29F5">
+				<Properties>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">ForceLoadChunksAtPosition</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+			<Item class="BindableFunction" referent="RBXAD11801E0B764AB19D790AE83587626B">
+				<Properties>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">GetPlayerWorkerInfo</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+			<Item class="BindableFunction" referent="RBX10F47CE042684773BC4942915A70DA16">
+				<Properties>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">GetTerrainConfig</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+			<Item class="BindableEvent" referent="RBXBE3806A31D4B4095BF838A1D97D858F7">
+				<Properties>
+					<BinaryString name="AttributesSerialize"></BinaryString>
+					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+					<bool name="DefinesCapabilities">false</bool>
+					<string name="Name">SetTerrainConfig</string>
+					<int64 name="SourceAssetId">-1</int64>
+					<BinaryString name="Tags"></BinaryString>
+				</Properties>
+			</Item>
+		</Item>
+		<Item class="ModuleScript" referent="RBXDE080808C78D48FFA945592FBE43F017">
+			<Properties>
+				<Content name="LinkedSource"><null></null></Content>
+				<ProtectedString name="Source"><![CDATA[--!strict
+local Serializer = {}
+
+--[[
+	This serializer converts Luau tables into a format that can be safely transmitted
+	and reconstructed. It handles complex scenarios including:
+	- Circular references (tables that refer to each other).
+	- Class instances (by hooking their metatables).
+	- Complex keys (e.g., using a table as a key).
+
+	SUPPORTED DATA TYPES:
+	- string, number, boolean
+	- vector (treated as a primitive)
+	- Tables (including SharedTables)
+
+	UNSUPPORTED DATA TYPES:
+	- Functions: Any key-value pair containing a function will be stripped during serialization.
+	- Other types (threads, userdata): Are not explicitly handled and may cause errors.
+]]
+
+-- Stores a mapping of className -> class table for deserialization.
+local hookedClasses: {[string]: any} = {}
+-- Stores a mapping of class table -> className for serialization.
+local classToName: {[any]: string} = {}
+local classNameCounter = 0
+
+local MAX_INT_KEY = 4294967296 -- 2^32
+
+--[[**
+	Checks if a given key is valid for direct serialization in the `content` table.
+	Valid keys are strings or non-negative integers.
+
+	@param key The key to validate.
+	@return A boolean indicating if the key is valid.
+**]]
+local function isKeyValid(key: any): boolean
+	local keyType = typeof(key)
+	if keyType == "string" then
+		return true
+	elseif keyType == "number" then
+		return math.floor(key) == key and key >= 0 and key < MAX_INT_KEY
+	end
+	return false
+end
+
+--[[**
+	Hooks a class (metatable) to the serializer. If the class does not have a
+	`__className` property, a unique one will be generated and assigned to it.
+
+	@param class The class table (metatable) to hook.
+**]]
+function Serializer:HookToSerializer(class: {[any]: any})
+	if typeof(class) ~= "table" then
+		warn("Attempted to hook a non-table value.")
+		return
+	end
+
+	if classToName[class] then
+		return -- Already hooked
+	end
+
+	local className = class.__className
+	if typeof(className) ~= "string" or className == "" then
+		classNameCounter += 1
+		className = "__AutoGenClass_" .. tostring(classNameCounter)
+		class.__className = className
+		warn("Class did not have a valid '__className'. Generated and assigned:", className)
+	end
+
+	hookedClasses[className] = class
+	classToName[class] = className
+end
+
+-- Forward declaration for the recursive serialize function
+local _Serialize
+
+--[[**
+	Serializes a Luau value or table. It correctly handles circular references
+	and strips functions, which cannot be serialized.
+
+	@param obj The value or table to serialize.
+	@return A new table containing the serialized data.
+**]]
+function Serializer:Serialize(obj: any): any
+	-- seenObjects: A cache mapping a table to a unique ID to handle cycles.
+	local seenObjects: {[any]: number} = {}
+	-- objectRegistry: A list that holds the serialized form of each unique table.
+	local objectRegistry: {any} = {}
+
+	local serializedRoot = _Serialize(obj, seenObjects, objectRegistry)
+
+	return {
+		root = serializedRoot,
+		registry = objectRegistry
+	}
+end
+
+--[[**
+	(Internal) The recursive core of the serialization process.
+
+	@param obj The value to serialize.
+	@param seenObjects The cache of already-processed tables.
+	@param objectRegistry The list where serialized tables are stored.
+	@return The serialized representation of the value.
+**]]
+_Serialize = function(obj: any, seenObjects: {[any]: number}, objectRegistry: {any}): any
+	-- Primitives (string, number, boolean) and vectors are returned as-is.
+	if typeof(obj) ~= "table" and typeof(obj) ~= "SharedTable" then
+		return obj
+	end
+
+	-- If we have seen this table before, return a reference to it.
+	if seenObjects[obj] then
+		return { __refId = seenObjects[obj] }
+	end
+
+	-- This is a new table. Assign it an ID and add it to the seen cache.
+	local objectId = #objectRegistry + 1
+	seenObjects[obj] = objectId
+
+	local serialized = {
+		content = {},
+		metadata = {}
+	}
+	serialized.__objId = objectId
+
+	-- Pre-emptively place the placeholder in the registry. This is crucial for circular references.
+	objectRegistry[objectId] = serialized
+
+	-- Handle metatable/class instances
+	local mt = getmetatable(obj)
+	if mt and classToName[mt] then
+		serialized.__className = classToName[mt]
+	end
+
+	-- Iterate through the object, serializing valid pairs.
+	for key, value in pairs(obj) do
+		-- Functions cannot be serialized. Skip any key-value pair that contains one.
+		if typeof(key) == "function" or typeof(value) == "function" then
+			-- The original code had an `error()` here which would halt serialization,
+			-- contradicting the documentation that functions are "stripped".
+			-- We now correctly skip the pair as intended.
+			continue -- Skip this iteration
+		end
+
+		local serializedValue = _Serialize(value, seenObjects, objectRegistry)
+
+		if isKeyValid(key) then
+			serialized.content[key] = serializedValue
+		else
+			-- The key is complex (e.g., a table), so it must also be serialized.
+			local serializedKey = _Serialize(key, seenObjects, objectRegistry)
+			table.insert(serialized.metadata, { key = serializedKey, value = serializedValue })
+		end
+	end
+
+	if #serialized.metadata == 0 then
+		serialized.metadata = nil
+	end
+
+	-- Return a reference to the fully populated object in the registry.
+	return { __refId = objectId }
+end
+
+--[[**
+	(Internal) The recursive core of the deserialization process.
+	It resolves references to objects in the registry.
+
+	@param serializedValue The serialized value or reference to deserialize.
+	@param reconstructedObjects The cache of already-created tables.
+	@return The actual Luau value or table.
+**]]
+local function _Deserialize(serializedValue: any, reconstructedObjects: {any}): any
+	local valueType = typeof(serializedValue)
+	-- Primitives (string, number, boolean, vector, etc.) are returned as-is.
+	if valueType ~= "table" and valueType ~= "SharedTable" then
+		return serializedValue
+	end
+
+	-- Check for reference
+	if serializedValue.__refId then
+		local objId = serializedValue.__refId
+		local obj = reconstructedObjects[objId]
+		if not obj then
+			error("Deserialization error: Reference ID not found in reconstructed objects: " .. tostring(objId))
+		end
+		return obj
+	end
+
+	-- Should not happen if serialization is correct, as all tables are referenced by __refId.
+	error("Deserialization error: Encountered an unexpected table structure.")
+end
+
+local function translateSharedTableToTable(st: SharedTable)
+	local out = {}
+	for k, v in st do
+		out[k] = typeof(v) == "SharedTable" and translateSharedTableToTable(v) or v
+	end
+	return out
+end
+
+--[[**
+	Deserializes a table from the format created by Serializer:Serialize.
+	It reconstructs circular references and class instances.
+
+	@param serializedData The table containing the 'root' and 'registry'.
+	@return The complete deserialized table or value.
+**]]
+function Serializer:Deserialize(serializedData: any): any
+	if typeof(serializedData) == "SharedTable" then
+		serializedData = translateSharedTableToTable(serializedData)
+	end
+
+	local registry = serializedData.registry
+	local registryType = typeof(registry)
+	if registryType ~= "table" then
+		error("Invalid serialized data: 'registry' is missing or not a table/SharedTable.")
+	end
+
+	-- reconstructedObjects maps objectId (index in registry) to the actual Luau table.
+	local reconstructedObjects: {any} = {}
+	local registrySize = #registry
+
+	-- PASS 1: Create all objects and handle class metatables.
+	-- This ensures all objects exist in reconstructedObjects before populating them,
+	-- which is essential for handling circular references.
+	for i = 1, registrySize do
+		local serializedObj = registry[i]
+		local newObj = {} -- Start with a plain table
+
+		-- Handle class instances
+		local className = serializedObj.__className
+		if className then
+			local class = hookedClasses[className]
+			if class then
+				setmetatable(newObj, class)
+			else
+				warn("Deserialization warning: Class name '%s' not hooked. Deserializing as plain table.", className)
+			end
+		end
+
+		-- Store the newly created object. The objectId must match the index 'i'.
+		local objId = serializedObj.__objId
+		if objId ~= i then
+			error("Deserialization error: Object ID mismatch at index " .. tostring(i))
+		end
+		reconstructedObjects[objId] = newObj
+	end
+
+	-- PASS 2: Populate the contents of all objects.
+	for i = 1, registrySize do
+		local serializedObj = registry[i]
+		local targetObj = reconstructedObjects[i]
+
+		-- 1. Populate 'content' (simple keys: string or non-negative integer)
+		local content = serializedObj.content
+		if content then
+			-- FIX: Use `pairs` to iterate over all keys in the content table.
+			-- The original implementation only iterated over the array part (1 to #content),
+			-- which caused all string keys and non-sequential integer keys to be missed.
+			for key, serializedValue in pairs(content) do
+				targetObj[key] = _Deserialize(serializedValue, reconstructedObjects)
+			end
+		end
+
+		-- 2. Populate 'metadata' (complex keys)
+		local metadata = serializedObj.metadata
+		if metadata then
+			local metadataSize = #metadata
+			for k = 1, metadataSize do -- Numeric loop is used for the array of metadata entries
+				local entry = metadata[k]
+				local originalKey = _Deserialize(entry.key, reconstructedObjects)
+				local originalValue = _Deserialize(entry.value, reconstructedObjects)
+				targetObj[originalKey] = originalValue
+			end
+		end
+	end
+
+	-- 3. Get the root object
+	local serializedRoot = serializedData.root
+	if not serializedRoot then
+		error("Invalid serialized data: 'root' is missing.")
+	end
+
+	return _Deserialize(serializedRoot, reconstructedObjects)
+end
+
+return Serializer]]></ProtectedString>
+				<string name="ScriptGuid">{10F39532-C47B-4B47-A499-D469D90AB1FD}</string>
+				<BinaryString name="AttributesSerialize"></BinaryString>
+				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
+				<bool name="DefinesCapabilities">false</bool>
+				<string name="Name">Serializer</string>
+				<int64 name="SourceAssetId">-1</int64>
+				<BinaryString name="Tags"></BinaryString>
+			</Properties>
+		</Item>
+	</Item>
+	<SharedStrings>
+		<SharedString md5="yuZpQdnvvUBOTYh1jqZ2cA=="></SharedString>
+	</SharedStrings>
+</roblox>
