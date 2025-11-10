@@ -2,7 +2,7 @@
 	<Meta name="ExplicitAutoJoints">true</Meta>
 	<External>null</External>
 	<External>nil</External>
-	<Item class="Script" referent="RBX39053F38E1194C1680C3BB7BAA2EA68B">
+	<Item class="Script" referent="RBX9A0975C4F12B42DFB8CDE5A8AEEF7BDE">
 		<Properties>
 			<ProtectedString name="Source"><![CDATA[--!native
 --[[
@@ -11,7 +11,6 @@
 	- API: Introduced a centralized configuration system. Use TerrainAPI.GetTerrainConfig() and TerrainAPI.SetTerrainConfig(newConfig) for safe, replicated config management.
 	- REFACTOR: Decoupled TerrainMath and FeatureGenerators from a static config file. They now receive the config as a parameter, improving thread safety and modularity.
 	- The active configuration is passed to workers via a SharedTable for each job, ensuring they always use the latest settings.
-    - FIX: Accurate chunk unloading now uses the stored Y bounds (startY and chunkHeight) instead of assuming Y=0 to MAX_HEIGHT.
 ]]
 
 -- Services
@@ -73,7 +72,6 @@ local function UpdateConfig(newConfigTable)
 	-- 3. Serialize and set the new contents (overwrite the internal data)
 	-- You can also merge/patch the data here instead of a full overwrite.
 	local serializedConfig = Serializer:Serialize(newConfigTable)
-	print(serializedConfig)
 
 	-- This sets the *internal data* of the existing shared table object
 	for key, value in serializedConfig do
@@ -389,14 +387,18 @@ function ChunkManager:Update()
 		-- ADDED: The "just-in-time" check to prevent unnecessary unloads.
 		if requiredChunks[chunkKey] then
 			-- This chunk is needed again! Rescue it from unloading.
-			-- print(`[ChunkManager] Unload cancelled for chunk {chunkKey}. It is needed again.`)
-
-			-- Restore the state (Loaded or Empty) based on the stored metadata
 			local metadata = self:_getChunkMetadata(job.x, job.z)
-			if type(metadata) == "table" then
-				self:setChunkState(job.x, job.z, metadata) -- Restore full metadata
+
+			if job.wasLoaded then
+				-- FIX 2: If loaded, explicitly set the state back to "Loaded" inside the metadata table.
+				if type(metadata) == "table" then
+					metadata.state = "Loaded" 
+				else
+					self:setChunkState(job.x, job.z, "Loaded")
+				end
 			else
-				self:setChunkState(job.x, job.z, job.wasLoaded and "Loaded" or "Empty") -- Fallback if only string was stored
+				-- If empty, restore the string state to "Empty".
+				self:setChunkState(job.x, job.z, "Empty") 
 			end
 
 			-- We don't decrement the budget because we didn't perform an unload.
@@ -671,8 +673,19 @@ function ChunkManager:_calculateUnloads(requiredChunks) -- MODIFIED: Accept para
 			local state = self:getChunkState(x, z) -- Use helper to get string state
 			if state == "Loaded" or state == "Empty" then
 				if not allRequiredChunks[self:getChunkKey(x, z)] then
-					self:setChunkState(x, z, "QueuedForUnload") -- Set state string
-					table.insert(newUnloadRequests, {x = x, z = z, wasLoaded = (state == "Loaded")})
+
+					local wasLoaded = (state == "Loaded")
+
+					if wasLoaded then
+						-- FIX 1: If Loaded, stateData is the table containing the region. 
+						-- Mutate the state field to QueuedForUnload while preserving the region reference.
+						stateData.state = "QueuedForUnload"
+					else
+						-- If Empty, stateData is the string "Empty". Overwrite it.
+						self:setChunkState(x, z, "QueuedForUnload") 
+					end
+
+					table.insert(newUnloadRequests, {x = x, z = z, wasLoaded = wasLoaded})
 				end
 			end
 		end
@@ -692,17 +705,8 @@ function ChunkManager:_unloadChunkInternal(chunkX, chunkZ, wasLoaded)
 	end
 
 	if wasLoaded then
-		-- FIX: Use the stored Y bounds for accurate clearing
-		local startY = stateData.startY
-		local chunkHeight = stateData.chunkHeight
-		local chunkSize = currentTerrainConfig.TERRAIN_CHUNK_SIZE
 		local resolution = currentTerrainConfig.VOXEL_RESOLUTION
-
-		local corner = Vector3.new(chunkX, startY, chunkZ)
-		local regionSize = Vector3.new(chunkSize, chunkHeight, chunkSize)
-
-		-- Clear only the region that was written
-		local region = Region3.new(corner, corner + regionSize):ExpandToGrid(resolution)
+		local region = stateData.region
 		Terrain:FillRegion(region, resolution, Enum.Material.Air)
 	end
 
@@ -753,11 +757,9 @@ function ChunkManager:OnChunkDataReady(chunkX, chunkZ, isEmpty, workerActor, hei
 		self:setChunkState(chunkX, chunkZ, state)
 	else
 		local region: Region3 = writeData.region
-		local regionMin, regionMax = region.CFrame.Position - region.Size / 2, region.CFrame.Position + region.Size / 2
 		self:setChunkState(chunkX, chunkZ, {
 			state = state,
-			startY = regionMin.Y,
-			chunkHeight = regionMax.Y - regionMin.Y,
+			region = region
 		})
 	end
 
@@ -952,7 +954,7 @@ print("TerrainService (Performance & Config API) is now running and API is ready
 			<int64 name="SourceAssetId">-1</int64>
 			<BinaryString name="Tags"></BinaryString>
 		</Properties>
-		<Item class="ModuleScript" referent="RBX374293C4F14541EA997C7366A91A848D">
+		<Item class="ModuleScript" referent="RBXCFF301372F694C6F907661B67349BC8D">
 			<Properties>
 				<Content name="LinkedSource"><null></null></Content>
 				<ProtectedString name="Source"><![CDATA[--!native
@@ -1233,7 +1235,7 @@ return TerrainConfig]]></ProtectedString>
 				<int64 name="SourceAssetId">-1</int64>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
-			<Item class="ModuleScript" referent="RBX00E50155C71A4CC6A5CB1643EC87D711">
+			<Item class="ModuleScript" referent="RBXA6C7554D867E4DFF85802E3779E193E1">
 				<Properties>
 					<Content name="LinkedSource"><null></null></Content>
 					<ProtectedString name="Source"><![CDATA[--!native
@@ -1285,7 +1287,7 @@ return Biome]]></ProtectedString>
 				</Properties>
 			</Item>
 		</Item>
-		<Item class="ModuleScript" referent="RBX94F628B076AC41E3A6BDCED9DC470132">
+		<Item class="ModuleScript" referent="RBX3A305EE9E47A48C2AE66816003CD555E">
 			<Properties>
 				<Content name="LinkedSource"><null></null></Content>
 				<ProtectedString name="Source"><![CDATA[--!native
@@ -1398,7 +1400,7 @@ return TerrainMath]]></ProtectedString>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
 		</Item>
-		<Item class="ModuleScript" referent="RBX356C5F3D7DBD481ABCD918924D0584E4">
+		<Item class="ModuleScript" referent="RBXE4982B7A700440A9A4BF0D162FDDCC5E">
 			<Properties>
 				<Content name="LinkedSource"><null></null></Content>
 				<ProtectedString name="Source"><![CDATA[--!native
@@ -1487,7 +1489,7 @@ return FeatureRegistry]]></ProtectedString>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
 		</Item>
-		<Item class="ModuleScript" referent="RBXFE3920645D314295B7E6A34E0B015CCA">
+		<Item class="ModuleScript" referent="RBXF9FFCB0622664D13B9C7A6663A3B88CB">
 			<Properties>
 				<Content name="LinkedSource"><null></null></Content>
 				<ProtectedString name="Source"><![CDATA[--!native
@@ -1640,7 +1642,7 @@ return FeaturePlacer]]></ProtectedString>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
 		</Item>
-		<Item class="Actor" referent="RBX5240AF50CE5C43769116B10D34370ED4">
+		<Item class="Actor" referent="RBXCCE10A82A31C49B8B124F37310089D5E">
 			<Properties>
 				<token name="LevelOfDetail">0</token>
 				<CoordinateFrame name="ModelMeshCFrame">
@@ -1676,7 +1678,7 @@ return FeaturePlacer]]></ProtectedString>
 				<int64 name="SourceAssetId">-1</int64>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
-			<Item class="Script" referent="RBX39F3A33615DB4164B300B2CB4E857C2F">
+			<Item class="Script" referent="RBXD74FF9C5A2CF4A5C987696773E337A1E">
 				<Properties>
 					<ProtectedString name="Source"><![CDATA[--!native
 -- SplinearTerrain-Caveless Worker v2.0 (High Performance)
@@ -1899,7 +1901,7 @@ actor:BindToMessageParallel("GenerateChunk", GenerateChunk)]]></ProtectedString>
 				</Properties>
 			</Item>
 		</Item>
-		<Item class="Folder" referent="RBXA9476DD1FD0B45DFA8749BB26A9903B9">
+		<Item class="Folder" referent="RBXF4FF8D68AD45437B98E00774A2B0AA66">
 			<Properties>
 				<BinaryString name="AttributesSerialize"></BinaryString>
 				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -1908,7 +1910,7 @@ actor:BindToMessageParallel("GenerateChunk", GenerateChunk)]]></ProtectedString>
 				<int64 name="SourceAssetId">-1</int64>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
-			<Item class="Folder" referent="RBX11C73FDF00EC43C7BC18A7945D8EA21F">
+			<Item class="Folder" referent="RBXFB25CA34FB7742DD8AAB4120021DB492">
 				<Properties>
 					<BinaryString name="AttributesSerialize"></BinaryString>
 					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -1917,7 +1919,7 @@ actor:BindToMessageParallel("GenerateChunk", GenerateChunk)]]></ProtectedString>
 					<int64 name="SourceAssetId">-1</int64>
 					<BinaryString name="Tags"></BinaryString>
 				</Properties>
-				<Item class="ModuleScript" referent="RBXDA31A46B1F574FA782C01760B846AF28">
+				<Item class="ModuleScript" referent="RBX8DE1DF6483F84F0BB8E5DE5E39569F3C">
 					<Properties>
 						<Content name="LinkedSource"><null></null></Content>
 						<ProtectedString name="Source"><![CDATA[--!native
@@ -2062,7 +2064,7 @@ return TreeGenerator]]></ProtectedString>
 						<BinaryString name="Tags"></BinaryString>
 					</Properties>
 				</Item>
-				<Item class="ModuleScript" referent="RBX21E8CF8C568B4AB6B69A151CF943FE7E">
+				<Item class="ModuleScript" referent="RBXF7564DBCF3B6484CB09C88EBCE135A74">
 					<Properties>
 						<Content name="LinkedSource"><null></null></Content>
 						<ProtectedString name="Source"><![CDATA[--!native
@@ -2226,7 +2228,7 @@ return VillageGenerator]]></ProtectedString>
 					</Properties>
 				</Item>
 			</Item>
-			<Item class="ModuleScript" referent="RBXE0AD19B8A8674796841134FB129FBB0B">
+			<Item class="ModuleScript" referent="RBXB7299130F5C749078AAF955EF5E447D5">
 				<Properties>
 					<Content name="LinkedSource"><null></null></Content>
 					<ProtectedString name="Source"><![CDATA[--!native
@@ -2354,7 +2356,7 @@ return FlowerGenerator]]></ProtectedString>
 				</Properties>
 			</Item>
 		</Item>
-		<Item class="ModuleScript" referent="RBX6B4BD24EDCA5495D99FB2FBAFF5681B2">
+		<Item class="ModuleScript" referent="RBX2518A37A574845DD9D934CCAA15CC144">
 			<Properties>
 				<Content name="LinkedSource"><null></null></Content>
 				<ProtectedString name="Source"><![CDATA[--!native
@@ -2577,7 +2579,7 @@ return Spline]]></ProtectedString>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
 		</Item>
-		<Item class="Actor" referent="RBXF4D7D743BC7A4678A9719DABCAFB7C4A">
+		<Item class="Actor" referent="RBX05FC3856500F4FF1A3C0AD72C8DFE435">
 			<Properties>
 				<token name="LevelOfDetail">0</token>
 				<CoordinateFrame name="ModelMeshCFrame">
@@ -2613,7 +2615,7 @@ return Spline]]></ProtectedString>
 				<int64 name="SourceAssetId">-1</int64>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
-			<Item class="Script" referent="RBX7A84373C1E7A41FC98262F5FACB057D4">
+			<Item class="Script" referent="RBX48DEFEAEDEF7489593F26B230AEEA586">
 				<Properties>
 					<ProtectedString name="Source"><![CDATA[task.synchronize()
 local HostActor: Actor = script.Parent
@@ -2639,7 +2641,7 @@ end)]]></ProtectedString>
 					<BinaryString name="Tags"></BinaryString>
 				</Properties>
 			</Item>
-			<Item class="BindableEvent" referent="RBXBD4D0A4702A4460B85A2633EC8C464B1">
+			<Item class="BindableEvent" referent="RBXE5FAE981BD2E4A30BFE3EA3E14CB7672">
 				<Properties>
 					<BinaryString name="AttributesSerialize"></BinaryString>
 					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -2649,7 +2651,7 @@ end)]]></ProtectedString>
 					<BinaryString name="Tags"></BinaryString>
 				</Properties>
 			</Item>
-			<Item class="BindableEvent" referent="RBXA60480CB2593465799CE660238683C5D">
+			<Item class="BindableEvent" referent="RBXDE6C89E56E9A4E64B94D15978F2C74D8">
 				<Properties>
 					<BinaryString name="AttributesSerialize"></BinaryString>
 					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -2660,7 +2662,7 @@ end)]]></ProtectedString>
 				</Properties>
 			</Item>
 		</Item>
-		<Item class="ModuleScript" referent="RBX381313F2BCB247509B268831468977CC">
+		<Item class="ModuleScript" referent="RBX68D4B5C4663440EDAF495615FD5C9293">
 			<Properties>
 				<Content name="LinkedSource"><null></null></Content>
 				<ProtectedString name="Source"><![CDATA[--[[
@@ -2736,7 +2738,7 @@ return TerrainAPI]]></ProtectedString>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
 		</Item>
-		<Item class="Folder" referent="RBX8C07D9E92CC248528609E01036C1D0FD">
+		<Item class="Folder" referent="RBX446FBC5A2BD241A8A50D56E95F1A06B5">
 			<Properties>
 				<BinaryString name="AttributesSerialize"></BinaryString>
 				<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -2745,7 +2747,7 @@ return TerrainAPI]]></ProtectedString>
 				<int64 name="SourceAssetId">-1</int64>
 				<BinaryString name="Tags"></BinaryString>
 			</Properties>
-			<Item class="BindableFunction" referent="RBX305D52C399664DAAABC16438D5E8524C">
+			<Item class="BindableFunction" referent="RBXF8E1367E03F94F5AB67B71B99BC98B87">
 				<Properties>
 					<BinaryString name="AttributesSerialize"></BinaryString>
 					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -2755,7 +2757,7 @@ return TerrainAPI]]></ProtectedString>
 					<BinaryString name="Tags"></BinaryString>
 				</Properties>
 			</Item>
-			<Item class="BindableFunction" referent="RBX1DF7B78FAE8440FDA3776300FF3C29F5">
+			<Item class="BindableFunction" referent="RBX1C4CBEA9E4814201B190378940086976">
 				<Properties>
 					<BinaryString name="AttributesSerialize"></BinaryString>
 					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -2765,7 +2767,7 @@ return TerrainAPI]]></ProtectedString>
 					<BinaryString name="Tags"></BinaryString>
 				</Properties>
 			</Item>
-			<Item class="BindableFunction" referent="RBXAD11801E0B764AB19D790AE83587626B">
+			<Item class="BindableFunction" referent="RBX64268A302A654A629DD30E52791ABD56">
 				<Properties>
 					<BinaryString name="AttributesSerialize"></BinaryString>
 					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -2775,7 +2777,7 @@ return TerrainAPI]]></ProtectedString>
 					<BinaryString name="Tags"></BinaryString>
 				</Properties>
 			</Item>
-			<Item class="BindableFunction" referent="RBX10F47CE042684773BC4942915A70DA16">
+			<Item class="BindableFunction" referent="RBX59DE76F46FF145F39E3F39C34FE6392E">
 				<Properties>
 					<BinaryString name="AttributesSerialize"></BinaryString>
 					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -2785,7 +2787,7 @@ return TerrainAPI]]></ProtectedString>
 					<BinaryString name="Tags"></BinaryString>
 				</Properties>
 			</Item>
-			<Item class="BindableEvent" referent="RBXBE3806A31D4B4095BF838A1D97D858F7">
+			<Item class="BindableEvent" referent="RBXBD8B5A6F81C9407E85D04449762DE8CD">
 				<Properties>
 					<BinaryString name="AttributesSerialize"></BinaryString>
 					<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
@@ -2796,7 +2798,7 @@ return TerrainAPI]]></ProtectedString>
 				</Properties>
 			</Item>
 		</Item>
-		<Item class="ModuleScript" referent="RBXDE080808C78D48FFA945592FBE43F017">
+		<Item class="ModuleScript" referent="RBX098094F4D7154E4C95716F1E781C57D9">
 			<Properties>
 				<Content name="LinkedSource"><null></null></Content>
 				<ProtectedString name="Source"><![CDATA[--!strict
